@@ -22,6 +22,7 @@ const TEXT_SCAN_MIN_SCORE = Number(process.env.TEXT_SCAN_MIN_SCORE || 20);
 const ENRICH_LIMIT = Number(process.env.ENRICH_LIMIT || 100);
 const RANKING_DIAGNOSTICS_VERSION = 8;
 const SIGNAL_PATTERN_VERSION = 2;
+const ASHARE_DATA_FILTER_VERSION = 2;
 
 const RESULT_FORMS = new Set(["10-Q", "10-K", "20-F", "40-F"]);
 const TEXT_FORMS = new Set([
@@ -2027,8 +2028,16 @@ function ashareDate(value) {
   return String(value || "").slice(0, 10);
 }
 
+function isStAshareName(name) {
+  return /^S?\*?ST/i.test(String(name || "").trim());
+}
+
 function isAshareRow(row) {
-  return /\.(SH|SZ|BJ)$/.test(row.SECUCODE || "") && row.SECURITY_TYPE !== "三板股";
+  return (
+    /\.(SH|SZ|BJ)$/.test(row.SECUCODE || "") &&
+    row.SECURITY_TYPE !== "三板股" &&
+    !isStAshareName(row.SECURITY_NAME_ABBR)
+  );
 }
 
 function ashareMarketPrefix(secucode) {
@@ -2375,7 +2384,7 @@ function resolveAshareRowQueries(rows, queries = []) {
 async function getAshareRankings(force = false, options = parseRankingOptions()) {
   const startedAt = Date.now();
   const reportInfo = ashareReportInfo();
-  const cacheName = `ashare-rankings-${reportInfo.date}-${rankingOptionsFingerprint(options)}.json`;
+  const cacheName = `ashare-rankings-v${ASHARE_DATA_FILTER_VERSION}-${reportInfo.date}-${rankingOptionsFingerprint(options)}.json`;
   if (!force) {
     const cached = await readCache(cacheName, RANKING_TTL);
     if (cached) return { ...cached, cache: "hit" };
@@ -2521,7 +2530,7 @@ async function getAshareRankings(force = false, options = parseRankingOptions())
 
 async function getAshareCalendar(month, force = false) {
   const normalizedMonth = month || new Date().toISOString().slice(0, 7);
-  const cacheName = `ashare-calendar-${normalizedMonth}.json`;
+  const cacheName = `ashare-calendar-v${ASHARE_DATA_FILTER_VERSION}-${normalizedMonth}.json`;
   if (!force) {
     const cached = await readCache(cacheName, CALENDAR_TTL);
     if (cached) return { ...cached, cache: "hit" };
