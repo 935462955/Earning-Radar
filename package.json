@@ -1,0 +1,14 @@
+{
+  "name": "earnings-radar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "US earnings season radar with SEC filing scoring and an earnings calendar.",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

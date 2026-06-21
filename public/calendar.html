@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>美股财报日历</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body data-page="calendar">
+    <header class="topbar">
+      <a class="brand" href="/">
+        <span class="brand-mark">ER</span>
+        <span>财报雷达</span>
+      </a>
+      <nav class="nav-tabs" aria-label="主导航">
+        <a href="/">亮眼度排名</a>
+        <a class="active" href="/calendar.html">财报日历</a>
+      </nav>
+    </header>
+
+    <main class="shell">
+      <section class="toolbar">
+        <div>
+          <h1>财报公布日历</h1>
+          <p id="calendar-subtitle">等待刷新</p>
+        </div>
+        <div class="actions">
+          <button class="icon-button" id="prev-month" type="button" aria-label="上个月">‹</button>
+          <input class="month-input" id="month-input" type="month" />
+          <button class="icon-button" id="next-month" type="button" aria-label="下个月">›</button>
+          <button class="primary-button" id="refresh-calendar" type="button">
+            <span aria-hidden="true">↻</span>
+            刷新日历
+          </button>
+        </div>
+      </section>
+
+      <section class="status-line" id="calendar-status" role="status"></section>
+
+      <section class="calendar-layout">
+        <div>
+          <div class="weekday-row" aria-hidden="true">
+            <span>Mon</span>
+            <span>Tue</span>
+            <span>Wed</span>
+            <span>Thu</span>
+            <span>Fri</span>
+            <span>Sat</span>
+            <span>Sun</span>
+          </div>
+          <div class="calendar-grid" id="calendar-grid"></div>
+        </div>
+        <aside class="day-panel">
+          <h2 id="day-title">选择日期</h2>
+          <div id="day-events" class="day-events"></div>
+        </aside>
+      </section>
+    </main>
+  </body>
+</html>

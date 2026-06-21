@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>美股财报亮眼度排名</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body data-page="ranking">
+    <header class="topbar">
+      <a class="brand" href="/">
+        <span class="brand-mark">ER</span>
+        <span>财报雷达</span>
+      </a>
+      <nav class="nav-tabs" aria-label="主导航">
+        <a class="active" href="/">亮眼度排名</a>
+        <a href="/calendar.html">财报日历</a>
+      </nav>
+    </header>
+
+    <main class="shell">
+      <section class="toolbar">
+        <div>
+          <h1>当前季度财报亮眼度排名</h1>
+          <p id="ranking-subtitle">等待刷新</p>
+        </div>
+        <div class="actions">
+          <button class="secondary-button" id="apply-ranking" type="button">
+            应用设置
+          </button>
+          <button class="primary-button" id="refresh-ranking" type="button">
+            <span aria-hidden="true">↻</span>
+            刷新数据
+          </button>
+        </div>
+      </section>
+
+      <section class="analysis-controls" aria-label="分析设置">
+        <label class="control-field">
+          <span>分析候选数</span>
+          <input id="analysis-limit" type="number" min="1" max="500" step="1" value="100" />
+        </label>
+        <label class="checkbox-field">
+          <input id="reuse-analysis" type="checkbox" checked />
+          <span>输入不变时复用已分析结果</span>
+        </label>
+        <label class="checkbox-field">
+          <input id="include-cash-flow" type="checkbox" />
+          <span>纳入经营现金流同比</span>
+        </label>
+        <label class="control-field compact">
+          <span>现金流阈值</span>
+          <input id="cash-flow-threshold" type="number" min="0" max="500" step="5" value="25" />
+        </label>
+        <label class="keyword-field">
+          <span>自定义文本关键词</span>
+          <textarea
+            id="custom-keywords"
+            rows="2"
+            placeholder="例：现金流改善: operating cash flow increased, cash flow from operations increased"
+          ></textarea>
+        </label>
+      </section>
+
+      <section class="summary-grid" aria-label="概览">
+        <div class="summary-item">
+          <span>已扫描</span>
+          <strong id="summary-scanned">--</strong>
+        </div>
+        <div class="summary-item">
+          <span>入榜公司</span>
+          <strong id="summary-ranked">--</strong>
+        </div>
+        <div class="summary-item">
+          <span>高景气标注</span>
+          <strong id="summary-hot">--</strong>
+        </div>
+        <div class="summary-item">
+          <span>缓存状态</span>
+          <strong id="summary-cache">--</strong>
+        </div>
+      </section>
+
+      <section class="status-line" id="ranking-status" role="status"></section>
+
+      <section class="diagnostics-panel" id="diagnostics-panel" hidden>
+        <div class="diagnostics-header">
+          <div>
+            <h2>覆盖与异常</h2>
+            <p id="coverage-summary"></p>
+          </div>
+          <span class="diagnostics-badge" id="diagnostics-badge">--</span>
+        </div>
+        <div class="criteria-grid" aria-label="筛选口径">
+          <div>
+            <span>候选来源</span>
+            <strong>静态池 + 财报日历</strong>
+            <p>当前披露窗口内所有 Nasdaq 日历公司都会进入首页扫描池。</p>
+          </div>
+          <div>
+            <span>分析顺序</span>
+            <strong>日历/披露时间优先</strong>
+            <p>先按日历日期和披露日期排序，再分析你设置的候选数量。</p>
+          </div>
+          <div>
+            <span>文本方法</span>
+            <strong>规则匹配</strong>
+            <p>扫描 SEC 主文档关键词/正则，不调用大模型。</p>
+          </div>
+        </div>
+        <div class="diagnostics-lists" id="diagnostics-lists"></div>
+      </section>
+
+      <section class="table-panel">
+        <div class="table-scroll">
+          <table class="ranking-table">
+            <thead>
+              <tr>
+                <th>排名</th>
+                <th>
+                  <button class="sort-button" type="button" data-sort-key="symbol">
+                    公司 <span class="sort-indicator" data-sort-indicator="symbol">↕</span>
+                  </button>
+                </th>
+                <th>
+                  <button class="sort-button" type="button" data-sort-key="score">
+                    分数 <span class="sort-indicator" data-sort-indicator="score">↓</span>
+                  </button>
+                </th>
+                <th>
+                  <button class="sort-button" type="button" data-sort-key="filingDate">
+                    财报披露 <span class="sort-indicator" data-sort-indicator="filingDate">↕</span>
+                  </button>
+                </th>
+                <th>
+                  <button class="sort-button" type="button" data-sort-key="revenue">
+                    营收同比 <span class="sort-indicator" data-sort-indicator="revenue">↕</span>
+                  </button>
+                </th>
+                <th>
+                  <button class="sort-button" type="button" data-sort-key="netIncome">
+                    净利同比 <span class="sort-indicator" data-sort-indicator="netIncome">↕</span>
+                  </button>
+                </th>
+                <th>
+                  <button class="sort-button" type="button" data-sort-key="margin">
+                    利润率变化 <span class="sort-indicator" data-sort-indicator="margin">↕</span>
+                  </button>
+                </th>
+                <th>
+                  <button class="sort-button" type="button" data-sort-key="signals">
+                    景气度信号 <span class="sort-indicator" data-sort-indicator="signals">↕</span>
+                  </button>
+                </th>
+                <th>链接</th>
+              </tr>
+            </thead>
+            <tbody id="ranking-body">
+              <tr>
+                <td colspan="9" class="empty-cell">点击刷新数据开始扫描。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
