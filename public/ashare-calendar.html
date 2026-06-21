@@ -3,11 +3,11 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>美股财报日历</title>
+    <title>A股财报日历</title>
     <link rel="stylesheet" href="/styles.css" />
     <script src="/app.js" defer></script>
   </head>
-  <body data-page="calendar" data-market="us">
+  <body data-page="calendar" data-market="cn">
     <header class="topbar">
       <a class="brand" href="/">
         <span class="brand-mark">ER</span>
@@ -15,16 +15,16 @@
       </a>
       <nav class="nav-tabs" aria-label="主导航">
         <a href="/">美股排名</a>
-        <a class="active" href="/calendar.html">美股日历</a>
+        <a href="/calendar.html">美股日历</a>
         <a href="/ashare.html">A股排名</a>
-        <a href="/ashare-calendar.html">A股日历</a>
+        <a class="active" href="/ashare-calendar.html">A股日历</a>
       </nav>
     </header>
 
     <main class="shell">
       <section class="toolbar">
         <div>
-          <h1>财报公布日历</h1>
+          <h1>A股财报公布日历</h1>
           <p id="calendar-subtitle">等待刷新</p>
         </div>
         <div class="actions">

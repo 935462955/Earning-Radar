@@ -1,6 +1,6 @@
 # 财报雷达启动说明
 
-这是一个本地运行的美股财报筛选网页，包含首页亮眼度排名和财报日历两个页面。
+这是一个本地运行的财报筛选网页，包含美股亮眼度排名、美股财报日历、A股亮眼度排名和 A股财报日历四个页面。
 
 ## 启动
 
@@ -15,6 +15,8 @@ SEC_USER_AGENT="earnings-radar your@email.com" node server.js
 
 - 首页排名：http://localhost:4173/
 - 财报日历：http://localhost:4173/calendar.html
+- A股排名：http://localhost:4173/ashare.html
+- A股日历：http://localhost:4173/ashare-calendar.html
 
 如果不设置 `SEC_USER_AGENT`，程序会使用默认值，但正式长期使用时建议换成自己的邮箱，方便符合 SEC EDGAR 的访问规范。
 
@@ -24,6 +26,7 @@ SEC_USER_AGENT="earnings-radar your@email.com" node server.js
 - 首页点击“刷新数据”会重新拉取 SEC 数据并重算当前披露窗口的亮眼度排名。
 - 日历页点击“刷新日历”会重新拉取 Nasdaq 财报日历。
 - 日历页公司卡片会显示 Nasdaq 日历返回的市值，并在选中日期后按需加载公司主营业务简介；简介优先来自 Nasdaq company profile，失败时回退到 SEC submissions 的行业分类。公司名会尝试翻译成中文，翻译成功时显示在英文名下方；简介默认折叠，可点击展开/收起，旁边有“翻译”按钮，点击后按单家公司翻译成中文并缓存结果。市值超过 1000 亿美元的公司会在日历格子和当天公司卡片中高亮。
+- A股页面使用东方财富公开数据：排名取 `RPT_LICO_FN_CPD` 业绩表现结构化数据，经营现金流取 `RPT_DMSK_FN_CASHFLOW`，市值/行业取 `RPT_VALUEANALYSIS_DET`，日历按公告日聚合，个股简介取东方财富 F10 公司资料。A股日历中的市值以人民币计，超过 1000 亿元人民币的公司会高亮。
 - 首次强制刷新可能需要几十秒到一两分钟，后续会命中本地 `.cache/` 缓存，通常是秒级。
 
 ## 首页筛选口径
@@ -73,6 +76,8 @@ AI订单: AI orders, AI backlog, accelerated AI demand
 - 文本主文档缺失或文本解析失败。
 - 有数据但未触发亮眼条件。
 
+A股排名页复用同一套交互：可以控制展示候选数、启用经营现金流同比、输入行业/主题关键词，并在“覆盖与异常”里查看未展示、未触发条件或估值/市值缺失的公司。A股当前使用东方财富结构化数据和公司资料，不调用大模型，也不逐字解析 PDF 财报文本。
+
 ## 股票池
 
 静态补充股票池在：
@@ -100,4 +105,10 @@ curl "http://localhost:4173/api/rankings?force=1"
 
 # 读取某个月的财报日历
 curl "http://localhost:4173/api/calendar?month=2026-06"
+
+# 读取 A股排名数据
+curl "http://localhost:4173/api/ashare-rankings"
+
+# 读取 A股某个月的财报日历
+curl "http://localhost:4173/api/ashare-calendar?month=2026-04"
 ```

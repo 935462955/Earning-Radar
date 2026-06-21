@@ -15,6 +15,26 @@ const state = {
 
 const $ = (selector) => document.querySelector(selector);
 
+function currentMarket() {
+  return document.body.dataset.market || "us";
+}
+
+function isAshareMarket() {
+  return currentMarket() === "cn";
+}
+
+function rankingEndpoint() {
+  return isAshareMarket() ? "/api/ashare-rankings" : "/api/rankings";
+}
+
+function calendarEndpoint() {
+  return isAshareMarket() ? "/api/ashare-calendar" : "/api/calendar";
+}
+
+function companyProfilesEndpoint() {
+  return isAshareMarket() ? "/api/ashare-company-profiles" : "/api/company-profiles";
+}
+
 function formatDateTime(value) {
   if (!value) return "--";
   return new Intl.DateTimeFormat("zh-CN", {
@@ -195,22 +215,31 @@ function renderDiagnostics(payload) {
     "frameFetchFailures",
     "missingSymbols",
     "notEnrichedDueLimit",
+    "marketDataMissing",
     "enrichFailures",
     "filingMissing",
     "textDocsMissing",
     "textScanFailures"
   ];
   const hardIssues = diagnosticsTotal(counts, hardIssueKeys);
-  const staticCount = payload.totals.configured;
-  const calendarCount = payload.totals.calendarSymbols ?? 0;
-  const combinedCount = payload.totals.combinedUniverse ?? staticCount;
   const selected = payload.totals.selectedForAnalysis ?? payload.totals.enriched;
-  $("#coverage-summary").textContent = `静态股票池 ${staticCount} 家，当前披露窗口日历 ${calendarCount} 家，合并后 ${combinedCount} 家；SEC 匹配 ${payload.totals.scanned} 家，亮眼候选 ${payload.totals.candidates} 家，按日历/披露时间选取 ${selected} 家，实际解析财报 ${payload.totals.enriched} 家，最终入榜 ${payload.totals.ranked} 家。分析缓存：复用 ${counts.analysisCacheHits || 0}，新算 ${counts.analysisCacheMisses || 0}。`;
+  if (payload.market === "cn") {
+    $("#coverage-summary").textContent = `A股 ${payload.reportingFrame?.label || payload.range.label} 财报记录 ${payload.totals.scanned} 条，亮眼候选 ${payload.totals.candidates} 家，本次展示 ${selected} 家，最终入榜 ${payload.totals.ranked} 家。`;
+  } else {
+    const staticCount = payload.totals.configured;
+    const calendarCount = payload.totals.calendarSymbols ?? 0;
+    const combinedCount = payload.totals.combinedUniverse ?? staticCount;
+    $("#coverage-summary").textContent = `静态股票池 ${staticCount} 家，当前披露窗口日历 ${calendarCount} 家，合并后 ${combinedCount} 家；SEC 匹配 ${payload.totals.scanned} 家，亮眼候选 ${payload.totals.candidates} 家，按日历/披露时间选取 ${selected} 家，实际解析财报 ${payload.totals.enriched} 家，最终入榜 ${payload.totals.ranked} 家。分析缓存：复用 ${counts.analysisCacheHits || 0}，新算 ${counts.analysisCacheMisses || 0}。`;
+  }
   const badge = $("#diagnostics-badge");
   badge.textContent = hardIssues ? `${hardIssues} 个需检查项` : "无接口/解析失败";
   badge.classList.toggle("has-issues", hardIssues > 0);
 
-  const categories = [
+  const categories = payload.market === "cn" ? [
+    ["marketDataMissing", "估值/市值数据缺失", "failure"],
+    ["notEnrichedDueLimit", "候选超过展示上限", "failure"],
+    ["noPositiveScore", "有数据但未触发亮眼条件", "neutral"]
+  ] : [
     ["calendarFetchFailures", "Nasdaq 日历接口失败", "failure"],
     ["frameFetchFailures", "SEC frames 接口失败", "failure"],
     ["frameConceptUnavailable", "SEC frames 指标无聚合数据", "notice"],
@@ -339,7 +368,10 @@ function renderRanking(payload, options = {}) {
   const reportLabel = payload.reportingFrame?.label
     ? `报告期 ${payload.reportingFrame.label}`
     : payload.range.label;
-  $("#ranking-subtitle").textContent = `${reportLabel} | 披露窗口 ${payload.range.start} 至 ${payload.range.today} | 更新 ${formatDateTime(payload.generatedAt)}`;
+  $("#ranking-subtitle").textContent =
+    payload.market === "cn"
+      ? `${reportLabel} | 已披露至 ${payload.range.today} | 更新 ${formatDateTime(payload.generatedAt)}`
+      : `${reportLabel} | 披露窗口 ${payload.range.start} 至 ${payload.range.today} | 更新 ${formatDateTime(payload.generatedAt)}`;
   $("#summary-scanned").textContent = payload.totals.scanned;
   $("#summary-ranked").textContent = payload.totals.ranked;
   $("#summary-hot").textContent = payload.rows.filter((row) => row.highlight).length;
@@ -410,11 +442,18 @@ async function loadRanking(force = false) {
   button.disabled = true;
   if (applyButton) applyButton.disabled = true;
   button.classList.add("loading");
-  setStatus("#ranking-status", force ? "正在从 SEC 刷新，首次可能需要几十秒到一两分钟..." : "正在应用设置并读取缓存...");
+  setStatus(
+    "#ranking-status",
+    force
+      ? isAshareMarket()
+        ? "正在刷新东方财富 A股财报数据，首次可能需要几十秒..."
+        : "正在从 SEC 刷新，首次可能需要几十秒到一两分钟..."
+      : "正在应用设置并读取缓存..."
+  );
   try {
     persistAnalysisOptions();
     const query = rankingQuery(force);
-    const payload = await fetchJson(`/api/rankings${query ? `?${query}` : ""}`);
+    const payload = await fetchJson(`${rankingEndpoint()}${query ? `?${query}` : ""}`);
     renderRanking(payload);
     const timing = payload.cache === "hit" ? "命中缓存" : `用时 ${(payload.elapsedMs / 1000).toFixed(1)} 秒`;
     setStatus(
@@ -452,14 +491,14 @@ function timeLabel(value) {
   );
 }
 
-function formatMarketCap(value) {
+function formatMarketCap(value, currency = "$") {
   if (!value || value === "N/A") return "--";
   const numeric = marketCapNumber(value);
   if (!Number.isFinite(numeric) || numeric <= 0) return value;
-  if (numeric >= 1e12) return `$${(numeric / 1e12).toFixed(2)}T`;
-  if (numeric >= 1e9) return `$${(numeric / 1e9).toFixed(1)}B`;
-  if (numeric >= 1e6) return `$${(numeric / 1e6).toFixed(1)}M`;
-  return `$${numeric.toLocaleString("en-US")}`;
+  if (numeric >= 1e12) return `${currency}${(numeric / 1e12).toFixed(2)}T`;
+  if (numeric >= 1e9) return `${currency}${(numeric / 1e9).toFixed(1)}B`;
+  if (numeric >= 1e6) return `${currency}${(numeric / 1e6).toFixed(1)}M`;
+  return `${currency}${numeric.toLocaleString("en-US")}`;
 }
 
 function marketCapNumber(value) {
@@ -542,7 +581,7 @@ async function ensureCompanyProfiles(date, events) {
   state.profileRequests.add(requestKey);
   try {
     const payload = await fetchJson(
-      `/api/company-profiles?symbols=${encodeURIComponent(missing.join(","))}`
+      `${companyProfilesEndpoint()}?symbols=${encodeURIComponent(missing.join(","))}`
     );
     Object.assign(state.companyProfiles, payload.profiles || {});
     if (state.selectedDate === date) renderDayPanel(date);
@@ -597,7 +636,7 @@ function renderDayPanel(date) {
             unchanged: "无中文结果",
             ok: "已翻译"
           }[translation?.status] || "翻译";
-        const industry = [profile.sector, profile.industry].filter(Boolean).join(" / ");
+        const industry = [profile.sector, profile.industry || item.industry].filter(Boolean).join(" / ");
         const megaCap = isMegaCap(item);
         return `<article class="event-row ${megaCap ? "is-mega-cap" : ""}">
         <div>
@@ -614,9 +653,9 @@ function renderDayPanel(date) {
         <div class="event-meta">
           <span>${timeLabel(item.time)}</span>
           ${megaCap ? "<span class=\"mega-cap-badge\">千亿市值</span>" : ""}
-          <span>市值 ${escapeHtml(formatMarketCap(item.marketCap))}</span>
+          <span>市值 ${escapeHtml(formatMarketCap(item.marketCap, item.marketCapCurrency || "$"))}</span>
           <span>${escapeHtml(item.fiscalQuarterEnding || "")}</span>
-          <span>EPS ${escapeHtml(item.epsForecast || "--")}</span>
+          <span>${escapeHtml(item.metricLabel || `EPS ${item.epsForecast || "--"}`)}</span>
           ${industry ? `<span>${escapeHtml(industry)}</span>` : ""}
         </div>
         <div class="event-business-block">
@@ -642,7 +681,9 @@ function renderDayPanel(date) {
         </div>
         <div class="link-cell">
           <a href="${escapeHtml(item.stockUrl)}" target="_blank" rel="noreferrer">股票页</a>
-          <a href="${escapeHtml(item.nasdaqUrl)}" target="_blank" rel="noreferrer">日历页</a>
+          <a href="${escapeHtml(item.nasdaqUrl)}" target="_blank" rel="noreferrer">${escapeHtml(
+            item.calendarLabel || "日历页"
+          )}</a>
         </div>
       </article>`;
       }
@@ -731,9 +772,18 @@ async function loadCalendar(force = false) {
   const button = $("#refresh-calendar");
   button.disabled = true;
   button.classList.add("loading");
-  setStatus("#calendar-status", force ? "正在刷新 Nasdaq 财报日历..." : "正在读取日历...");
+  setStatus(
+    "#calendar-status",
+    force
+      ? isAshareMarket()
+        ? "正在刷新东方财富 A股财报日历..."
+        : "正在刷新 Nasdaq 财报日历..."
+      : "正在读取日历..."
+  );
   try {
-    const payload = await fetchJson(`/api/calendar?month=${encodeURIComponent(month)}${force ? "&force=1" : ""}`);
+    const payload = await fetchJson(
+      `${calendarEndpoint()}?month=${encodeURIComponent(month)}${force ? "&force=1" : ""}`
+    );
     renderCalendar(payload);
     setStatus(
       "#calendar-status",

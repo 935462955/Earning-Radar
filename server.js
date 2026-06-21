@@ -270,6 +270,78 @@ async function cachedNasdaqJson(url, force = false, ttl = CALENDAR_TTL) {
   return payload;
 }
 
+function eastmoneyReferer(url) {
+  if (String(url).includes("emweb.securities.eastmoney.com")) {
+    return "https://emweb.securities.eastmoney.com/";
+  }
+  if (String(url).includes("quote.eastmoney.com") || String(url).includes("push2.eastmoney.com")) {
+    return "https://quote.eastmoney.com/center/gridlist.html";
+  }
+  return "https://data.eastmoney.com/";
+}
+
+async function fetchEastmoneyJson(url) {
+  const response = await fetchWithTimeout(url, {
+    timeoutMs: 20000,
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+      Accept: "application/json, text/plain, */*",
+      Referer: eastmoneyReferer(url)
+    }
+  });
+  return response.json();
+}
+
+async function cachedEastmoneyJson(url, force = false, ttl = CALENDAR_TTL) {
+  const name = `eastmoney-json-${hashKey(url)}.json`;
+  if (!force) {
+    const cached = await readCache(name, ttl);
+    if (cached) return cached;
+  }
+  const payload = await fetchEastmoneyJson(url);
+  await writeCache(name, payload);
+  return payload;
+}
+
+function eastmoneyDataUrl(reportName, params = {}) {
+  const query = new URLSearchParams({
+    pageNumber: "1",
+    pageSize: "500",
+    sortColumns: "NOTICE_DATE,SECURITY_CODE",
+    sortTypes: "-1,1",
+    source: "WEB",
+    client: "WEB",
+    reportName,
+    columns: "ALL",
+    ...params
+  });
+  return `https://datacenter-web.eastmoney.com/api/data/v1/get?${query.toString()}`;
+}
+
+async function fetchEastmoneyPaged(reportName, params = {}, force = false) {
+  const pageSize = Number(params.pageSize || 500);
+  const firstUrl = eastmoneyDataUrl(reportName, { ...params, pageNumber: "1", pageSize });
+  const first = await cachedEastmoneyJson(firstUrl, force);
+  const result = first?.result || {};
+  const rows = [...(result.data || [])];
+  const pages = Math.min(Number(result.pages || 1), 50);
+  if (pages <= 1) return rows;
+  const rest = await mapLimit(
+    Array.from({ length: pages - 1 }, (_, index) => index + 2),
+    4,
+    async (pageNumber) => {
+      const url = eastmoneyDataUrl(reportName, { ...params, pageNumber, pageSize });
+      return cachedEastmoneyJson(url, force);
+    }
+  );
+  for (const page of rest) {
+    if (page?.error) continue;
+    rows.push(...(page?.result?.data || []));
+  }
+  return rows;
+}
+
 function hasChineseText(value) {
   return /[\u3400-\u9fff]/.test(String(value || ""));
 }
@@ -1818,6 +1890,604 @@ async function getCalendar(month, force = false) {
   return { ...payload, cache: "fresh" };
 }
 
+function ashareReportInfo(now = new Date()) {
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth() + 1;
+  if (month >= 11) return { date: `${year}-09-30`, label: `${year} 三季报` };
+  if (month >= 9) return { date: `${year}-06-30`, label: `${year} 半年报` };
+  if (month >= 5) return { date: `${year}-03-31`, label: `${year} 一季报` };
+  return { date: `${year - 1}-12-31`, label: `${year - 1} 年报` };
+}
+
+function asharePeriodLabel(reportDate) {
+  const value = String(reportDate || "").slice(0, 10);
+  const year = value.slice(0, 4);
+  if (value.endsWith("-03-31")) return `${year} 一季报`;
+  if (value.endsWith("-06-30")) return `${year} 半年报`;
+  if (value.endsWith("-09-30")) return `${year} 三季报`;
+  if (value.endsWith("-12-31")) return `${year} 年报`;
+  return value || "财报";
+}
+
+function ashareDate(value) {
+  return String(value || "").slice(0, 10);
+}
+
+function isAshareRow(row) {
+  return /\.(SH|SZ|BJ)$/.test(row.SECUCODE || "") && row.SECURITY_TYPE !== "三板股";
+}
+
+function ashareMarketPrefix(secucode) {
+  if (String(secucode).endsWith(".SH")) return "SH";
+  if (String(secucode).endsWith(".BJ")) return "BJ";
+  return "SZ";
+}
+
+function ashareQuoteSecid(secucode) {
+  const code = String(secucode || "").slice(0, 6);
+  if (String(secucode).endsWith(".SH")) return `1.${code}`;
+  return `0.${code}`;
+}
+
+function ashareStockUrl(secucode) {
+  const code = String(secucode || "").slice(0, 6);
+  const prefix = ashareMarketPrefix(secucode).toLowerCase();
+  return `https://quote.eastmoney.com/${prefix}${code}.html`;
+}
+
+function ashareReportUrl(secucode) {
+  const code = String(secucode || "").slice(0, 6);
+  return `https://emweb.securities.eastmoney.com/PC_HSF10/FinanceAnalysis/Index?type=web&code=${ashareMarketPrefix(
+    secucode
+  )}${code}`;
+}
+
+function ashareMoney(value) {
+  if (!Number.isFinite(Number(value))) return "";
+  return formatNumber(Number(value));
+}
+
+function ashareMarketCapDisplay(value) {
+  if (!Number.isFinite(Number(value)) || Number(value) <= 0) return "";
+  return `¥${Math.round(Number(value)).toLocaleString("en-US")}`;
+}
+
+async function fetchAshareQuotes(secucodes, force = false) {
+  const wanted = new Set(secucodes.map((item) => String(item || "").slice(0, 6)).filter(Boolean));
+  try {
+    const latestUrl = eastmoneyDataUrl("RPT_VALUEANALYSIS_DET", {
+      pageNumber: "1",
+      pageSize: "1",
+      sortColumns: "TRADE_DATE",
+      sortTypes: "-1",
+      columns: "SECURITY_CODE,TRADE_DATE"
+    });
+    const latest = await cachedEastmoneyJson(latestUrl, force, SEC_TTL);
+    const tradeDate = ashareDate(latest?.result?.data?.[0]?.TRADE_DATE);
+    if (!tradeDate) return new Map();
+    const rows = await fetchEastmoneyPaged(
+      "RPT_VALUEANALYSIS_DET",
+      {
+        pageSize: "500",
+        sortColumns: "SECURITY_CODE",
+        sortTypes: "1",
+        columns:
+          "SECURITY_CODE,SECUCODE,SECURITY_NAME_ABBR,TOTAL_MARKET_CAP,NOTLIMITED_MARKETCAP_A,BOARD_NAME,TRADE_DATE",
+        filter: `(TRADE_DATE='${tradeDate}')`
+      },
+      force
+    );
+    const output = new Map();
+    for (const item of rows) {
+      const code = String(item.SECURITY_CODE || "").slice(0, 6);
+      if (wanted.size && !wanted.has(code)) continue;
+      output.set(code, {
+        symbol: code,
+        secucode: item.SECUCODE || "",
+        name: item.SECURITY_NAME_ABBR || code,
+        marketCap: Number(item.TOTAL_MARKET_CAP) || null,
+        floatMarketCap: Number(item.NOTLIMITED_MARKETCAP_A) || null,
+        industry: item.BOARD_NAME || "",
+        tradeDate
+      });
+    }
+    return output;
+  } catch {
+    return new Map();
+  }
+}
+
+function priorAshareReportDate(reportDate) {
+  const value = ashareDate(reportDate);
+  if (!value) return "";
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return "";
+  return `${year - 1}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+async function fetchAshareCashFlowMap(reportDate, force = false) {
+  if (!reportDate) return new Map();
+  const rows = await fetchEastmoneyPaged(
+    "RPT_DMSK_FN_CASHFLOW",
+    {
+      pageSize: "500",
+      sortColumns: "NOTICE_DATE,SECURITY_CODE",
+      sortTypes: "-1,1",
+      columns:
+        "SECUCODE,SECURITY_CODE,SECURITY_NAME_ABBR,REPORT_DATE,NOTICE_DATE,NETCASH_OPERATE",
+      filter: `(REPORT_DATE='${reportDate}')`
+    },
+    force
+  );
+  const output = new Map();
+  for (const row of rows) {
+    if (!/\.(SH|SZ|BJ)$/.test(row.SECUCODE || "")) continue;
+    const code = String(row.SECURITY_CODE || "").slice(0, 6);
+    if (!code) continue;
+    output.set(code, {
+      value: Number(row.NETCASH_OPERATE),
+      reportDate: ashareDate(row.REPORT_DATE),
+      filingDate: ashareDate(row.NOTICE_DATE)
+    });
+  }
+  return output;
+}
+
+function ashareCashFlowMetric(code, currentMap, priorMap, row) {
+  const current = currentMap?.get(code);
+  const prior = priorMap?.get(code);
+  const metricGrowth = growth(
+    Number.isFinite(current?.value) ? { val: current.value } : null,
+    Number.isFinite(prior?.value) ? { val: prior.value } : null
+  );
+  return {
+    current: current?.value,
+    currentDisplay: Number.isFinite(current?.value) ? formatNumber(current.value) : row.MGJYXJJE ?? "",
+    prior: prior?.value,
+    priorDisplay: Number.isFinite(prior?.value) ? formatNumber(prior.value) : "",
+    growthPct: metricGrowth.pct,
+    turnaround: metricGrowth.turnaround
+  };
+}
+
+function ashareCustomFindings(row, quote = {}, options = {}, cashFlowMetric = {}) {
+  const findings = [];
+  if (options.includeCashFlow) {
+    if (cashFlowMetric.turnaround) {
+      findings.push({ label: "经营现金流扭亏", value: "turnaround" });
+    } else if (
+      Number.isFinite(cashFlowMetric.growthPct) &&
+      cashFlowMetric.growthPct >= options.cashFlowThreshold
+    ) {
+      findings.push({
+        label: "经营现金流增长",
+        value: `同比 ${(cashFlowMetric.growthPct * 100).toFixed(1)}%`
+      });
+    }
+  }
+  const haystack = [
+    row.SECURITY_NAME_ABBR,
+    row.BOARD_NAME,
+    row.PUBLISHNAME,
+    quote.industry
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  for (const rule of options.customKeywordRules || []) {
+    const matched = rule.terms.find((term) => haystack.includes(String(term).toLowerCase()));
+    if (matched) {
+      findings.push({ label: `自定义：${rule.label}`, value: `匹配 ${matched}` });
+    }
+  }
+  return findings;
+}
+
+function scoreAshareRow(row, options = {}, cashFlowMetric = {}) {
+  const state = { score: 0, reasons: [] };
+  const revenueGrowth = Number(row.YSTZ);
+  const profitGrowth = Number(row.SJLTZ);
+  const profit = Number(row.PARENT_NETPROFIT);
+  const roe = Number(row.WEIGHTAVG_ROE);
+  const grossMargin = Number(row.XSMLL);
+  const cashFlowPerShare = Number(row.MGJYXJJE);
+
+  if (Number.isFinite(revenueGrowth)) {
+    if (revenueGrowth >= 100) {
+      state.score += 40;
+      state.reasons.push("营收同比翻倍");
+    } else if (revenueGrowth >= 50) {
+      state.score += 32;
+      state.reasons.push("营收同比>50%");
+    } else if (revenueGrowth >= 25) {
+      state.score += 22;
+      state.reasons.push("营收同比>25%");
+    } else if (revenueGrowth >= 10) {
+      state.score += 10;
+      state.reasons.push("营收同比>10%");
+    }
+  }
+  if (Number.isFinite(profitGrowth)) {
+    if (profitGrowth >= 100) {
+      state.score += 32;
+      state.reasons.push("归母净利同比翻倍");
+    } else if (profitGrowth >= 50) {
+      state.score += 24;
+      state.reasons.push("归母净利同比>50%");
+    } else if (profitGrowth >= 25) {
+      state.score += 14;
+      state.reasons.push("归母净利同比>25%");
+    } else if (profitGrowth >= 10) {
+      state.score += 8;
+      state.reasons.push("归母净利同比>10%");
+    }
+  }
+  if (Number.isFinite(profit) && profit > 0 && Number.isFinite(roe)) {
+    if (roe >= 15) {
+      state.score += 12;
+      state.reasons.push("ROE>15%");
+    } else if (roe >= 8) {
+      state.score += 6;
+      state.reasons.push("ROE>8%");
+    }
+  }
+  if (Number.isFinite(grossMargin) && grossMargin >= 40) {
+    state.score += 5;
+    state.reasons.push("毛利率>40%");
+  }
+  if (options.includeCashFlow) {
+    if (cashFlowMetric.turnaround) {
+      state.score += 14;
+      state.reasons.push("经营现金流扭亏");
+    } else if (Number.isFinite(cashFlowMetric.growthPct)) {
+      if (cashFlowMetric.growthPct >= Math.max(1, options.cashFlowThreshold * 3)) {
+        state.score += 18;
+        state.reasons.push("经营现金流同比翻倍");
+      } else if (cashFlowMetric.growthPct >= options.cashFlowThreshold) {
+        state.score += 12;
+        state.reasons.push(`经营现金流同比>${options.cashFlowThresholdPct}%`);
+      } else if (cashFlowMetric.growthPct >= 0.1) {
+        state.score += 6;
+        state.reasons.push("经营现金流同比>10%");
+      }
+    } else if (Number.isFinite(cashFlowPerShare) && cashFlowPerShare > 0) {
+      state.score += 4;
+      state.reasons.push("经营现金流/股为正");
+    }
+  }
+  return state;
+}
+
+function ashareRowToRanking(row, quote = {}, options = {}, cashFlowMetric = {}) {
+  const secucode = row.SECUCODE || `${row.SECURITY_CODE}.SZ`;
+  const metricScore = scoreAshareRow(row, options, cashFlowMetric);
+  const signals = [];
+  const customFindings = ashareCustomFindings(row, quote, options, cashFlowMetric);
+  const revenueGrowth = Number(row.YSTZ);
+  const profitGrowth = Number(row.SJLTZ);
+  if (Number.isFinite(revenueGrowth) && revenueGrowth >= 50) {
+    signals.push({
+      label: "营收高增长",
+      score: 8,
+      hits: [{ form: row.DATATYPE || asharePeriodLabel(row.REPORTDATE), filingDate: ashareDate(row.NOTICE_DATE), context: `营收同比 ${revenueGrowth.toFixed(1)}%`, url: ashareReportUrl(secucode) }]
+    });
+  }
+  if (Number.isFinite(profitGrowth) && profitGrowth >= 50) {
+    signals.push({
+      label: "净利高增长",
+      score: 8,
+      hits: [{ form: row.DATATYPE || asharePeriodLabel(row.REPORTDATE), filingDate: ashareDate(row.NOTICE_DATE), context: `归母净利同比 ${profitGrowth.toFixed(1)}%`, url: ashareReportUrl(secucode) }]
+    });
+  }
+  const score = Math.min(100, metricScore.score + Math.min(16, signals.reduce((sum, item) => sum + item.score, 0)));
+  return {
+    symbol: row.SECURITY_CODE,
+    name: row.SECURITY_NAME_ABBR || quote.name || row.SECURITY_CODE,
+    exchange: row.TRADE_MARKET || "",
+    score,
+    highlight: score >= 70 || signals.length >= 2,
+    reasons: metricScore.reasons,
+    signals,
+    customFindings,
+    filing: {
+      form: row.DATATYPE || asharePeriodLabel(row.REPORTDATE),
+      filingDate: ashareDate(row.NOTICE_DATE),
+      reportDate: ashareDate(row.REPORTDATE),
+      accessionNumber: secucode,
+      primaryDocument: "",
+      url: ashareReportUrl(secucode)
+    },
+    stockUrl: ashareStockUrl(secucode),
+    metrics: {
+      revenue: {
+        growthPct: Number.isFinite(Number(row.YSTZ)) ? Number(row.YSTZ) / 100 : null,
+        turnaround: false,
+        current: { display: ashareMoney(row.TOTAL_OPERATE_INCOME), value: row.TOTAL_OPERATE_INCOME }
+      },
+      netIncome: {
+        growthPct: Number.isFinite(Number(row.SJLTZ)) ? Number(row.SJLTZ) / 100 : null,
+        turnaround: false,
+        current: { display: ashareMoney(row.PARENT_NETPROFIT), value: row.PARENT_NETPROFIT }
+      },
+      epsDiluted: { growthPct: null, turnaround: false, current: { display: row.BASIC_EPS ?? "" } },
+      operatingCashFlow: {
+        growthPct: Number.isFinite(cashFlowMetric.growthPct) ? cashFlowMetric.growthPct : null,
+        turnaround: cashFlowMetric.turnaround || false,
+        current: { display: cashFlowMetric.currentDisplay || (row.MGJYXJJE ?? ""), value: cashFlowMetric.current ?? null },
+        prior: { display: cashFlowMetric.priorDisplay || "", value: cashFlowMetric.prior ?? null }
+      },
+      grossMargin: Number.isFinite(Number(row.XSMLL)) ? Number(row.XSMLL) / 100 : null,
+      grossMarginDelta: null,
+      operatingMargin: null,
+      operatingMarginDelta: null
+    }
+  };
+}
+
+async function getAshareRankings(force = false, options = parseRankingOptions()) {
+  const startedAt = Date.now();
+  const reportInfo = ashareReportInfo();
+  const cacheName = `ashare-rankings-${reportInfo.date}-${rankingOptionsFingerprint(options)}.json`;
+  if (!force) {
+    const cached = await readCache(cacheName, RANKING_TTL);
+    if (cached) return { ...cached, cache: "hit" };
+  }
+  const rawRows = (
+    await fetchEastmoneyPaged(
+      "RPT_LICO_FN_CPD",
+      {
+        sortColumns: "NOTICE_DATE,SECURITY_CODE",
+        sortTypes: "-1,1",
+        filter: `(REPORTDATE='${reportInfo.date}')`
+      },
+      force
+    )
+  ).filter(isAshareRow);
+  const deduped = new Map();
+  for (const row of rawRows) {
+    const key = `${ashareDate(row.NOTICE_DATE)}:${row.SECUCODE}`;
+    const existing = deduped.get(key);
+    if (!existing || String(row.REPORTDATE || "").localeCompare(String(existing.REPORTDATE || "")) > 0) {
+      deduped.set(key, row);
+    }
+  }
+  const rows = [...deduped.values()];
+  const quoteMap = await fetchAshareQuotes(rows.map((row) => row.SECUCODE), force);
+  const cashFlowCurrentMap = options.includeCashFlow
+    ? await fetchAshareCashFlowMap(reportInfo.date, force)
+    : new Map();
+  const cashFlowPriorMap = options.includeCashFlow
+    ? await fetchAshareCashFlowMap(priorAshareReportDate(reportInfo.date), force)
+    : new Map();
+  const allRanked = rows
+    .map((row) => {
+      const code = String(row.SECURITY_CODE || "").slice(0, 6);
+      return ashareRowToRanking(
+        row,
+        quoteMap.get(code),
+        options,
+        ashareCashFlowMetric(code, cashFlowCurrentMap, cashFlowPriorMap, row)
+      );
+    })
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return String(b.filing.filingDate).localeCompare(String(a.filing.filingDate));
+    });
+  const positive = allRanked.filter((row) => row.score > 0);
+  const ranked = positive.slice(0, options.analysisLimit);
+  const diagnostics = {
+    version: 1,
+    counts: {
+      noPositiveScore: allRanked.length - positive.length,
+      notEnrichedDueLimit: Math.max(0, positive.length - ranked.length),
+      marketDataMissing: rows.filter((row) => !quoteMap.has(String(row.SECURITY_CODE || "").slice(0, 6))).length,
+      analysisCacheHits: 0,
+      analysisCacheMisses: ranked.length
+    },
+    marketDataMissing: rows
+      .filter((row) => !quoteMap.has(String(row.SECURITY_CODE || "").slice(0, 6)))
+      .slice(0, 500)
+      .map((row) => ({
+        symbol: row.SECURITY_CODE,
+        name: row.SECURITY_NAME_ABBR || row.SECURITY_CODE,
+        filingDate: ashareDate(row.NOTICE_DATE),
+        reportDate: ashareDate(row.REPORTDATE),
+        reason: "东方财富估值数据未返回该公司，市值和行业可能缺失"
+      })),
+    noPositiveScore: allRanked
+      .filter((row) => row.score <= 0)
+      .slice(0, 500)
+      .map((row) => ({
+        symbol: row.symbol,
+        name: row.name,
+        filingDate: row.filing.filingDate,
+        reportDate: row.filing.reportDate,
+        reason: "有财报数据，但未触发营收/归母净利/ROE/毛利率/现金流亮眼条件"
+      })),
+    notEnrichedDueLimit: positive.slice(options.analysisLimit, options.analysisLimit + 500).map((row) => ({
+      symbol: row.symbol,
+      name: row.name,
+      filingDate: row.filing.filingDate,
+      reportDate: row.filing.reportDate,
+      metricScore: row.score,
+      reason: `超过本次分析数量 ${options.analysisLimit}，未展示在榜单中`
+    }))
+  };
+  const payload = {
+    market: "cn",
+    generatedAt: new Date().toISOString(),
+    elapsedMs: Date.now() - startedAt,
+    range: { label: reportInfo.label, start: reportInfo.date, end: reportInfo.date, today: toDateOnly(new Date()) },
+    reportingFrame: { label: reportInfo.label, frame: reportInfo.date },
+    analysisOptions: {
+      analysisLimit: options.analysisLimit,
+      reuseAnalysis: options.reuseAnalysis,
+      method: "东方财富业绩表现结构化数据 + 规则评分",
+      usesLLM: false,
+      includeCashFlow: options.includeCashFlow,
+      cashFlowThresholdPct: options.cashFlowThresholdPct,
+      customKeywordRules: options.customKeywordRules
+    },
+    source: {
+      filings: "东方财富数据中心 RPT_LICO_FN_CPD",
+      text: "当前 A股版本使用结构化指标与公司资料，不调用大模型",
+      universe: "东方财富 A股财报数据"
+    },
+    totals: {
+      configured: rows.length,
+      scanned: rows.length,
+      candidates: positive.length,
+      analyzable: positive.length,
+      selectedForAnalysis: ranked.length,
+      enriched: ranked.length,
+      ranked: ranked.length,
+      diagnostics: diagnostics.counts
+    },
+    diagnostics,
+    rows: ranked
+  };
+  await writeCache(cacheName, payload);
+  return { ...payload, cache: "fresh" };
+}
+
+async function getAshareCalendar(month, force = false) {
+  const normalizedMonth = month || new Date().toISOString().slice(0, 7);
+  const cacheName = `ashare-calendar-${normalizedMonth}.json`;
+  if (!force) {
+    const cached = await readCache(cacheName, CALENDAR_TTL);
+    if (cached) return { ...cached, cache: "hit" };
+  }
+  const startedAt = Date.now();
+  const start = `${normalizedMonth}-01`;
+  const [year, monthIndex] = normalizedMonth.split("-").map(Number);
+  const end = toDateOnly(new Date(Date.UTC(year, monthIndex, 0)));
+  const calendarRowsRaw = (
+    await fetchEastmoneyPaged(
+      "RPT_LICO_FN_CPD",
+      {
+        sortColumns: "NOTICE_DATE,SECURITY_CODE",
+        sortTypes: "1,1",
+        filter: `(NOTICE_DATE>='${start}')(NOTICE_DATE<='${end}')`
+      },
+      force
+    )
+  ).filter(isAshareRow);
+  const calendarRowsByCompany = new Map();
+  for (const row of calendarRowsRaw) {
+    const key = `${ashareDate(row.NOTICE_DATE)}:${row.SECUCODE}`;
+    const existing = calendarRowsByCompany.get(key);
+    if (!existing || String(row.REPORTDATE || "").localeCompare(String(existing.REPORTDATE || "")) > 0) {
+      calendarRowsByCompany.set(key, row);
+    }
+  }
+  const rows = [...calendarRowsByCompany.values()];
+  const quoteMap = await fetchAshareQuotes(rows.map((row) => row.SECUCODE), force);
+  const byDate = {};
+  for (const row of rows) {
+    const date = ashareDate(row.NOTICE_DATE);
+    const quote = quoteMap.get(row.SECURITY_CODE) || {};
+    const secucode = row.SECUCODE;
+    const event = {
+      date,
+      symbol: row.SECURITY_CODE,
+      name: row.SECURITY_NAME_ABBR || quote.name || row.SECURITY_CODE,
+      marketCap: ashareMarketCapDisplay(quote.marketCap),
+      marketCapCurrency: "¥",
+      time: "time-not-supplied",
+      fiscalQuarterEnding: asharePeriodLabel(row.REPORTDATE),
+      metricLabel: `EPS ${row.BASIC_EPS ?? "--"}`,
+      epsForecast: row.BASIC_EPS ?? "",
+      noOfEsts: "",
+      lastYearRptDt: "",
+      lastYearEPS: "",
+      industry: quote.industry || row.BOARD_NAME || row.PUBLISHNAME || "",
+      stockUrl: ashareStockUrl(secucode),
+      nasdaqUrl: ashareReportUrl(secucode),
+      calendarLabel: "财报页"
+    };
+    if (!byDate[date]) byDate[date] = [];
+    byDate[date].push(event);
+  }
+  for (const events of Object.values(byDate)) {
+    events.sort((a, b) => Number(String(b.marketCap).replace(/[^0-9.-]/g, "")) - Number(String(a.marketCap).replace(/[^0-9.-]/g, "")));
+  }
+  const totalEvents = Object.values(byDate).reduce((sum, events) => sum + events.length, 0);
+  const payload = {
+    market: "cn",
+    month: normalizedMonth,
+    generatedAt: new Date().toISOString(),
+    elapsedMs: Date.now() - startedAt,
+    source: "东方财富业绩表现公告日",
+    totalEvents,
+    byDate
+  };
+  await writeCache(cacheName, payload);
+  return { ...payload, cache: "fresh" };
+}
+
+async function fetchAshareCompanyProfile(symbol, force = false) {
+  const code = normalizeTicker(symbol).slice(0, 6);
+  const secucode =
+    code.startsWith("6") ? `${code}.SH` : code.startsWith("8") || code.startsWith("9") ? `${code}.BJ` : `${code}.SZ`;
+  const params = new URLSearchParams({
+    pageNumber: "1",
+    pageSize: "1",
+    source: "HSF10",
+    client: "PC",
+    reportName: "RPT_F10_ORG_BASICINFO",
+    columns: "ALL",
+    filter: `(SECUCODE="${secucode}")`
+  });
+  const url = `https://datacenter.eastmoney.com/securities/api/data/v1/get?${params.toString()}`;
+  const payload = await cachedEastmoneyJson(url, force, PROFILE_TTL);
+  const data = payload?.result?.data?.[0] || {};
+  const quoteMap = await fetchAshareQuotes([secucode], force);
+  const quote = quoteMap.get(code) || {};
+  return {
+    symbol: code,
+    name: data.SECURITY_NAME_ABBR || quote.name || code,
+    chineseName: data.ORG_NAME || "",
+    sector: data.EM2016 || "",
+    industry: quote.industry || data.MAIN_BUSINESS || "",
+    region: data.REGIONBK || "",
+    marketCap: ashareMarketCapDisplay(quote.marketCap),
+    businessDescription: normalizedDescription(
+      [data.MAIN_BUSINESS ? `主营业务：${data.MAIN_BUSINESS}` : "", data.ORG_PROFIE || ""]
+        .filter(Boolean)
+        .join("。"),
+      1800
+    ),
+    profileSource: "东方财富 F10 公司资料",
+    status: data.SECURITY_CODE ? "ok" : "empty"
+  };
+}
+
+async function getAshareCompanyProfiles(symbols, force = false) {
+  const normalizedSymbols = [
+    ...new Set(
+      String(symbols || "")
+        .split(/[,，\s]+/)
+        .map((symbol) => symbol.trim().slice(0, 6))
+        .filter(Boolean)
+    )
+  ].slice(0, 120);
+  const rows = await mapLimit(normalizedSymbols, 5, (symbol) => fetchAshareCompanyProfile(symbol, force));
+  const profiles = {};
+  for (const row of rows) {
+    if (row?.error) {
+      profiles[row.item || ""] = { symbol: row.item || "", status: "error", businessDescription: "", error: row.error };
+    } else if (row?.symbol) {
+      profiles[row.symbol] = row;
+    }
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    source: "东方财富 F10 公司资料",
+    requested: normalizedSymbols.length,
+    profiles
+  };
+}
+
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
@@ -1844,6 +2514,8 @@ async function serveStatic(req, res, pathname) {
   let filePath = pathname === "/" ? "/index.html" : pathname;
   if (filePath === "/ranking") filePath = "/index.html";
   if (filePath === "/calendar") filePath = "/calendar.html";
+  if (filePath === "/ashare") filePath = "/ashare.html";
+  if (filePath === "/ashare-calendar") filePath = "/ashare-calendar.html";
   const resolved = path.normalize(path.join(PUBLIC_DIR, filePath));
   if (!resolved.startsWith(PUBLIC_DIR)) {
     sendJson(res, 403, { error: "Forbidden" });
@@ -1870,16 +2542,34 @@ async function route(req, res) {
       sendJson(res, 200, await getRankings(force, options));
       return;
     }
+    if (requestUrl.pathname === "/api/ashare-rankings") {
+      const force = requestUrl.searchParams.get("force") === "1";
+      const options = parseRankingOptions(requestUrl.searchParams);
+      sendJson(res, 200, await getAshareRankings(force, options));
+      return;
+    }
     if (requestUrl.pathname === "/api/calendar") {
       const force = requestUrl.searchParams.get("force") === "1";
       const month = requestUrl.searchParams.get("month");
       sendJson(res, 200, await getCalendar(month, force));
       return;
     }
+    if (requestUrl.pathname === "/api/ashare-calendar") {
+      const force = requestUrl.searchParams.get("force") === "1";
+      const month = requestUrl.searchParams.get("month");
+      sendJson(res, 200, await getAshareCalendar(month, force));
+      return;
+    }
     if (requestUrl.pathname === "/api/company-profiles") {
       const force = requestUrl.searchParams.get("force") === "1";
       const symbols = requestUrl.searchParams.get("symbols") || "";
       sendJson(res, 200, await getCompanyProfiles(symbols, force));
+      return;
+    }
+    if (requestUrl.pathname === "/api/ashare-company-profiles") {
+      const force = requestUrl.searchParams.get("force") === "1";
+      const symbols = requestUrl.searchParams.get("symbols") || "";
+      sendJson(res, 200, await getAshareCompanyProfiles(symbols, force));
       return;
     }
     if (requestUrl.pathname === "/api/translate") {
