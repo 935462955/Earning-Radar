@@ -209,7 +209,7 @@ input {
 
 .analysis-controls {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  grid-template-columns: repeat(12, minmax(0, 1fr));
   gap: 10px;
   align-items: end;
   margin: 14px 0 4px;
@@ -219,8 +219,17 @@ input {
   background: #fbfcfe;
 }
 
-.focus-field {
-  min-width: 220px;
+.analysis-controls > .control-field {
+  grid-column: span 2;
+}
+
+.analysis-controls > .checkbox-field {
+  grid-column: span 3;
+}
+
+.analysis-controls > .focus-field {
+  grid-column: span 4;
+  min-width: 0;
 }
 
 .control-field,
@@ -274,8 +283,8 @@ input {
 }
 
 .keyword-field {
-  grid-column: span 2;
-  min-width: min(100%, 320px);
+  grid-column: span 8;
+  min-width: 0;
 }
 
 .summary-grid {
@@ -872,6 +881,22 @@ button.calendar-cell {
   cursor: default;
 }
 
+@media (max-width: 1320px) {
+  .analysis-controls {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+
+  .analysis-controls > .control-field,
+  .analysis-controls > .checkbox-field {
+    grid-column: span 3;
+  }
+
+  .analysis-controls > .focus-field,
+  .keyword-field {
+    grid-column: span 6;
+  }
+}
+
 @media (max-width: 980px) {
   .topbar,
   .toolbar {
@@ -900,8 +925,11 @@ button.calendar-cell {
     grid-template-columns: 1fr;
   }
 
+  .analysis-controls > .control-field,
+  .analysis-controls > .checkbox-field,
+  .focus-field,
   .keyword-field {
-    grid-column: auto;
+    grid-column: 1 / -1;
   }
 
   .day-panel {
