@@ -120,6 +120,54 @@ function rowSignalChips(row) {
   return `${custom}${defaultSignals}`;
 }
 
+function normalizeSearchText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9\u3400-\u9fff]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseCompanyFilters(value = "") {
+  const filters = [];
+  const push = (text) => {
+    const normalized = normalizeSearchText(text);
+    if (normalized && !filters.includes(normalized)) filters.push(normalized);
+  };
+  String(value || "")
+    .split(/[,，;；\n\r]+/)
+    .forEach((chunk) => {
+      push(chunk);
+      const tokens = chunk.trim().split(/\s+/).filter(Boolean);
+      if (tokens.length > 1) tokens.forEach(push);
+    });
+  return filters;
+}
+
+function rowMatchesCompanyFilter(row, filters) {
+  if (!filters.length) return true;
+  const haystack = normalizeSearchText(
+    [
+      row.symbol,
+      row.name,
+      row.exchange,
+      ...(row.manualQueries || []),
+      ...(row.reasons || []),
+      ...(row.signals || []).map((signal) => signal.label)
+    ].join(" ")
+  );
+  return filters.some((filter) => haystack.includes(filter));
+}
+
+function filteredRankingRows(rows) {
+  const filters = parseCompanyFilters($("#focus-companies")?.value || "");
+  return {
+    filters,
+    rows: filters.length ? rows.filter((row) => rowMatchesCompanyFilter(row, filters)) : rows
+  };
+}
+
 function readAnalysisOptions() {
   return {
     limit: Math.min(500, Math.max(1, Number($("#analysis-limit")?.value || 100))),
@@ -382,6 +430,9 @@ function setRankingSort(key) {
 
 function renderRanking(payload, options = {}) {
   state.ranking = payload;
+  const display = filteredRankingRows(payload.rows);
+  const rowsToDisplay = display.rows;
+  const hasCompanyFilter = display.filters.length > 0;
   const reportLabel = payload.reportingFrame?.label
     ? `报告期 ${payload.reportingFrame.label}`
     : payload.range.label;
@@ -390,8 +441,10 @@ function renderRanking(payload, options = {}) {
       ? `${reportLabel} | 已披露至 ${payload.range.today} | 更新 ${formatDateTime(payload.generatedAt)}`
       : `${reportLabel} | 披露窗口 ${payload.range.start} 至 ${payload.range.today} | 更新 ${formatDateTime(payload.generatedAt)}`;
   $("#summary-scanned").textContent = payload.totals.scanned;
-  $("#summary-ranked").textContent = payload.totals.ranked;
-  $("#summary-hot").textContent = payload.rows.filter((row) => row.highlight).length;
+  $("#summary-ranked").textContent = hasCompanyFilter
+    ? `${rowsToDisplay.length}/${payload.totals.ranked}`
+    : payload.totals.ranked;
+  $("#summary-hot").textContent = rowsToDisplay.filter((row) => row.highlight).length;
   $("#summary-cache").textContent = payload.cache === "fresh" ? "已刷新" : "缓存";
   renderDiagnostics(payload);
 
@@ -400,9 +453,14 @@ function renderRanking(payload, options = {}) {
     body.innerHTML = '<tr><td colspan="9" class="empty-cell">当前股票池暂无符合条件的财报。</td></tr>';
     return;
   }
+  if (!rowsToDisplay.length) {
+    body.innerHTML =
+      '<tr><td colspan="9" class="empty-cell">未找到匹配指定公司的结果；清空“指定公司”后可查看全部。</td></tr>';
+    return;
+  }
 
   updateSortIndicators();
-  body.innerHTML = sortedRankingRows(payload.rows)
+  body.innerHTML = sortedRankingRows(rowsToDisplay)
     .map((row, index) => {
       const revenue = metricGrowthCell(row.metrics.revenue);
       const netIncome = metricGrowthCell(row.metrics.netIncome);
@@ -829,6 +887,10 @@ function initRanking() {
   ["analysis-limit", "reuse-analysis", "include-cash-flow", "cash-flow-threshold", "focus-companies", "custom-keywords"].forEach((id) => {
     const element = document.getElementById(id);
     if (element) element.addEventListener("change", persistAnalysisOptions);
+  });
+  $("#focus-companies")?.addEventListener("input", () => {
+    persistAnalysisOptions();
+    if (state.ranking) renderRanking(state.ranking);
   });
   $("#focus-companies")?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
