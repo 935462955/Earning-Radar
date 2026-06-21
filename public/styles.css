@@ -209,7 +209,7 @@ input {
 
 .analysis-controls {
   display: grid;
-  grid-template-columns: 140px minmax(190px, auto) minmax(160px, auto) 120px minmax(280px, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 10px;
   align-items: end;
   margin: 14px 0 4px;
@@ -217,6 +217,10 @@ input {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fbfcfe;
+}
+
+.focus-field {
+  min-width: 220px;
 }
 
 .control-field,
@@ -267,6 +271,11 @@ input {
   color: var(--text);
   font-size: 13px;
   font-weight: 500;
+}
+
+.keyword-field {
+  grid-column: span 2;
+  min-width: min(100%, 320px);
 }
 
 .summary-grid {
@@ -534,7 +543,8 @@ input {
   font-weight: 780;
 }
 
-.hot-badge {
+.hot-badge,
+.manual-badge {
   display: inline-flex;
   align-items: center;
   min-height: 22px;
@@ -544,6 +554,11 @@ input {
   color: var(--amber);
   font-size: 12px;
   font-weight: 760;
+}
+
+.manual-badge {
+  background: #eef5ff;
+  color: #244f91;
 }
 
 .score-bar {
@@ -883,6 +898,10 @@ button.calendar-cell {
   .criteria-grid,
   .calendar-layout {
     grid-template-columns: 1fr;
+  }
+
+  .keyword-field {
+    grid-column: auto;
   }
 
   .day-panel {

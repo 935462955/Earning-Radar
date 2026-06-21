@@ -489,8 +489,39 @@ function parseCustomKeywordRules(input = "") {
     .filter((rule) => rule.label && rule.terms.length);
 }
 
+function parseCompanyQueries(input = "") {
+  const queries = [];
+  const push = (value) => {
+    const normalized = String(value || "").replace(/\s+/g, " ").trim();
+    if (normalized && !queries.includes(normalized)) queries.push(normalized);
+  };
+  for (const chunk of String(input || "").split(/[,，;；\n\r]+/)) {
+    push(chunk);
+    const tokens = chunk.trim().split(/\s+/).filter(Boolean);
+    if (tokens.length > 1) {
+      const tokenLikeQueries = tokens.filter((token) =>
+        /^[A-Za-z0-9._-]{1,12}$/.test(token) || /[\u3400-\u9fff]/.test(token)
+      );
+      if (tokenLikeQueries.length === tokens.length) {
+        tokenLikeQueries.forEach(push);
+      }
+    }
+  }
+  return queries.slice(0, 20);
+}
+
+function normalizedSearchText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9\u3400-\u9fff]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function parseRankingOptions(params = new URLSearchParams()) {
   const customKeywordText = params.get("keywords") || "";
+  const focusCompanyText = params.get("focus") || "";
   const includeCashFlow = params.get("cashFlow") === "1";
   const cashFlowThresholdPct = clampNumber(params.get("cashFlowThreshold"), 25, 0, 500);
   const analysisLimit = clampNumber(params.get("limit"), ENRICH_LIMIT, 1, 500);
@@ -501,7 +532,9 @@ function parseRankingOptions(params = new URLSearchParams()) {
     cashFlowThresholdPct,
     cashFlowThreshold: cashFlowThresholdPct / 100,
     customKeywordText,
-    customKeywordRules: parseCustomKeywordRules(customKeywordText)
+    customKeywordRules: parseCustomKeywordRules(customKeywordText),
+    focusCompanyText,
+    focusCompanyQueries: parseCompanyQueries(focusCompanyText)
   };
 }
 
@@ -512,6 +545,7 @@ function rankingOptionsFingerprint(options) {
       includeCashFlow: options.includeCashFlow,
       cashFlowThresholdPct: options.cashFlowThresholdPct,
       customKeywordRules: options.customKeywordRules,
+      focusCompanyQueries: options.focusCompanyQueries,
       diagnosticsVersion: RANKING_DIAGNOSTICS_VERSION,
       signalPatternVersion: SIGNAL_PATTERN_VERSION
     })
@@ -575,6 +609,34 @@ async function loadTickerMap(force = false) {
     map.set(normalizeTicker(ticker), { cik, name, ticker: normalizeTicker(ticker), exchange });
   }
   return map;
+}
+
+function resolveTickerQueries(tickerMap, queries = []) {
+  const matches = new Map();
+  const missing = [];
+  const companies = [...tickerMap.values()];
+  for (const query of queries) {
+    const normalizedTickerQuery = normalizeTicker(query);
+    let match =
+      tickerMap.get(normalizedTickerQuery) ||
+      companies.find((company) => normalizedSearchText(company.name) === normalizedSearchText(query)) ||
+      companies.find((company) => normalizedSearchText(company.name).startsWith(normalizedSearchText(query))) ||
+      (normalizedSearchText(query).length >= 3
+        ? companies.find((company) => normalizedSearchText(company.name).includes(normalizedSearchText(query)))
+        : null);
+    if (!match) {
+      missing.push({
+        query,
+        reason: "指定公司未在 SEC ticker/name 映射中匹配到"
+      });
+      continue;
+    }
+    const symbol = normalizeTicker(match.ticker);
+    const existing = matches.get(symbol) || { ...match, ticker: symbol, queries: [] };
+    existing.queries = sourceSet(...existing.queries, query);
+    matches.set(symbol, existing);
+  }
+  return { matches: [...matches.values()], missing };
 }
 
 function conceptSeries(facts, metric) {
@@ -1204,6 +1266,7 @@ function createRankingDiagnostics() {
     frameFetchFailures: [],
     frameConceptUnavailable: [],
     missingSymbols: [],
+    manualCompanyMissing: [],
     noCurrentFrameFacts: [],
     noPositiveScore: [],
     notEnrichedDueLimit: [],
@@ -1239,6 +1302,7 @@ function diagnosticsCounts(diagnostics) {
     frameFetchFailures: diagnostics.frameFetchFailures.length,
     frameConceptUnavailable: diagnostics.frameConceptUnavailable.length,
     missingSymbols: diagnostics.missingSymbols.length,
+    manualCompanyMissing: diagnostics.manualCompanyMissing.length,
     noCurrentFrameFacts: diagnostics.noCurrentFrameFacts.length,
     noPositiveScore: diagnostics.noPositiveScore.length,
     notEnrichedDueLimit: diagnostics.notEnrichedDueLimit.length,
@@ -1296,6 +1360,8 @@ function analysisCacheName(candidate, range, frameInfo, options) {
     JSON.stringify({
       symbol: candidate.symbol,
       cik: candidate.cik,
+      forced: candidate.forced || false,
+      manualQueries: candidate.manualQueries || [],
       frame: frameInfo.frame,
       rangeStart: range.start,
       rangeToday: range.today,
@@ -1370,7 +1436,12 @@ async function enrichFrameCandidate(candidate, range, force, diagnostics, option
     exchange: candidate.company.exchange || "",
     score,
     highlight,
-    reasons: candidate.metricScore.reasons,
+    forced: candidate.forced || false,
+    manualQueries: candidate.manualQueries || [],
+    reasons:
+      candidate.metricScore.reasons.length || !candidate.forced
+        ? candidate.metricScore.reasons
+        : ["指定分析：未触发亮眼条件"],
     signals,
     customFindings,
     filing: filing
@@ -1411,7 +1482,12 @@ async function enrichFrameCandidateWithCache(candidate, range, force, diagnostic
     if (cached?.row) {
       diagnostics.analysisCacheHits += 1;
       mergeDiagnostics(diagnostics, cached.diagnosticsDelta);
-      return { ...cached.row, analysisCache: "hit" };
+      return {
+        ...cached.row,
+        forced: candidate.forced || cached.row.forced || false,
+        manualQueries: candidate.manualQueries || cached.row.manualQueries || [],
+        analysisCache: "hit"
+      };
     }
   }
   diagnostics.analysisCacheMisses += 1;
@@ -1461,6 +1537,8 @@ async function getRankings(force = false, options = parseRankingOptions()) {
   const universe = await loadUniverse();
   const calendarUniverse = await getCalendarSymbolsForRange(range, force, diagnostics);
   const tickerMap = await loadTickerMap(force);
+  const manualCompanies = resolveTickerQueries(tickerMap, options.focusCompanyQueries);
+  diagnostics.manualCompanyMissing.push(...manualCompanies.missing);
   const frameMaps = await loadFrameMetrics(frameInfo, force, diagnostics);
   const universeMap = new Map();
   for (const symbol of universe.symbols) {
@@ -1481,6 +1559,25 @@ async function getRankings(force = false, options = parseRankingOptions()) {
       });
     }
   }
+  for (const company of manualCompanies.matches) {
+    const symbol = normalizeTicker(company.ticker);
+    const existing = universeMap.get(symbol);
+    if (existing) {
+      existing.sources = sourceSet(...existing.sources, "manual");
+      existing.manualQueries = sourceSet(...(existing.manualQueries || []), ...(company.queries || []));
+      existing.forced = true;
+      existing.calendarName = existing.calendarName || company.name;
+    } else {
+      universeMap.set(symbol, {
+        symbol,
+        sources: ["manual"],
+        calendarDates: [],
+        calendarName: company.name,
+        manualQueries: company.queries || [],
+        forced: true
+      });
+    }
+  }
   const universeItems = [...universeMap.values()].sort((a, b) => a.symbol.localeCompare(b.symbol));
   const symbols = universeItems.filter((item) => tickerMap.has(item.symbol)).map((item) => item.symbol);
   const missingSymbols = universeItems.filter((item) => !tickerMap.has(item.symbol));
@@ -1496,6 +1593,7 @@ async function getRankings(force = false, options = parseRankingOptions()) {
   for (const symbol of symbols) {
     const company = tickerMap.get(symbol);
     const universeItem = universeMap.get(symbol);
+    const forced = universeItem?.forced || false;
     const rawMetrics = metricsFromFrames(frameMaps, company.cik);
     const hasCurrentFacts =
       rawMetrics.revenue.current ||
@@ -1510,7 +1608,7 @@ async function getRankings(force = false, options = parseRankingOptions()) {
         calendarDates: universeItem?.calendarDates || [],
         reason: `SEC frames 中没有 ${frameInfo.frame} 的当前营收、净利润或已启用自定义指标事实`
       });
-      continue;
+      if (!forced) continue;
     }
     const metricScore = scoreMetrics(rawMetrics, options);
     if (metricScore.score <= 0) {
@@ -1528,9 +1626,11 @@ async function getRankings(force = false, options = parseRankingOptions()) {
         frame: latestFact?.frame || frameInfo.frame,
         accessionNumber: latestFact?.accn || "",
         metricScore: metricScore.score,
-        reason: "已有当前期事实，但未触发营收/净利/利润率改善或自定义指标条件"
+        reason: forced
+          ? "指定公司已强制展示；当前评分未触发营收/净利/利润率改善或自定义指标条件"
+          : "已有当前期事实，但未触发营收/净利/利润率改善或自定义指标条件"
       });
-      continue;
+      if (!forced) continue;
     }
     candidates.push({
       symbol,
@@ -1538,15 +1638,26 @@ async function getRankings(force = false, options = parseRankingOptions()) {
       cik: company.cik,
       sources: universeItem?.sources || [],
       calendarDates: universeItem?.calendarDates || [],
+      forced,
+      manualQueries: universeItem?.manualQueries || [],
       rawMetrics,
       metricScore,
       accessions: accessionsFromMetrics(rawMetrics)
     });
   }
   const orderedCandidates = sortCandidatesByDisclosureTime(candidates);
-  const selectedCandidates = orderedCandidates.slice(0, options.analysisLimit);
+  const selectedCandidates = [];
+  const selectedSymbols = new Set();
+  for (const candidate of orderedCandidates) {
+    if (selectedCandidates.length < options.analysisLimit || candidate.forced) {
+      if (!selectedSymbols.has(candidate.symbol)) {
+        selectedCandidates.push(candidate);
+        selectedSymbols.add(candidate.symbol);
+      }
+    }
+  }
   diagnostics.notEnrichedDueLimit = orderedCandidates
-    .slice(options.analysisLimit)
+    .filter((candidate) => !selectedSymbols.has(candidate.symbol) && !candidate.forced)
     .map((candidate) =>
       candidateSummary(
         candidate,
@@ -1566,7 +1677,7 @@ async function getRankings(force = false, options = parseRankingOptions()) {
   diagnostics.enrichFailures.push(...resolveErrors);
   const resolvedCandidates = resolvedCandidatesRaw.filter((row) => row && !row.error);
   const analysisCandidates = sortCandidatesByDisclosureTime(
-    resolvedCandidates.filter((candidate) => candidate.filing?.filingDate)
+    resolvedCandidates.filter((candidate) => candidate.filing?.filingDate || candidate.forced)
   );
 
   const rows = await mapLimit(analysisCandidates, 4, async (candidate) => {
@@ -1583,6 +1694,7 @@ async function getRankings(force = false, options = parseRankingOptions()) {
 
   const successfulRows = rows.filter((row) => row && !row.error);
   const rowsInDisclosureWindow = successfulRows.filter((row) => {
+    if (row.forced) return true;
     if (!row.filing.filingDate) return false;
     const inWindow = inDateRange(row.filing.filingDate, range.start, range.today);
     if (!inWindow) {
@@ -1600,7 +1712,7 @@ async function getRankings(force = false, options = parseRankingOptions()) {
   });
 
   const ranked = rowsInDisclosureWindow
-    .filter((row) => row.score > 0 || row.signals.length)
+    .filter((row) => row.forced || row.score > 0 || row.signals.length)
     .sort((a, b) => {
       if (b.score !== a.score) return b.score - a.score;
       return String(b.filing.filingDate).localeCompare(String(a.filing.filingDate));
@@ -1621,7 +1733,8 @@ async function getRankings(force = false, options = parseRankingOptions()) {
       usesLLM: false,
       includeCashFlow: options.includeCashFlow,
       cashFlowThresholdPct: options.cashFlowThresholdPct,
-      customKeywordRules: options.customKeywordRules
+      customKeywordRules: options.customKeywordRules,
+      focusCompanyQueries: options.focusCompanyQueries
     },
     source: {
       filings: "SEC EDGAR frames + submissions",
@@ -1638,6 +1751,7 @@ async function getRankings(force = false, options = parseRankingOptions()) {
       selectedForAnalysis: selectedCandidates.length,
       enriched: analysisCandidates.length,
       ranked: ranked.length,
+      forced: ranked.filter((row) => row.forced).length,
       missingSymbols,
       errors,
       diagnostics: diagnostics.counts
@@ -2158,7 +2272,7 @@ function scoreAshareRow(row, options = {}, cashFlowMetric = {}) {
   return state;
 }
 
-function ashareRowToRanking(row, quote = {}, options = {}, cashFlowMetric = {}) {
+function ashareRowToRanking(row, quote = {}, options = {}, cashFlowMetric = {}, meta = {}) {
   const secucode = row.SECUCODE || `${row.SECURITY_CODE}.SZ`;
   const metricScore = scoreAshareRow(row, options, cashFlowMetric);
   const signals = [];
@@ -2186,7 +2300,12 @@ function ashareRowToRanking(row, quote = {}, options = {}, cashFlowMetric = {}) 
     exchange: row.TRADE_MARKET || "",
     score,
     highlight: score >= 70 || signals.length >= 2,
-    reasons: metricScore.reasons,
+    forced: meta.forced || false,
+    manualQueries: meta.manualQueries || [],
+    reasons:
+      metricScore.reasons.length || !meta.forced
+        ? metricScore.reasons
+        : ["指定分析：未触发亮眼条件"],
     signals,
     customFindings,
     filing: {
@@ -2224,6 +2343,35 @@ function ashareRowToRanking(row, quote = {}, options = {}, cashFlowMetric = {}) 
   };
 }
 
+function resolveAshareRowQueries(rows, queries = []) {
+  const matches = new Map();
+  const missing = [];
+  for (const query of queries) {
+    const codeMatch = String(query).match(/\d{6}/);
+    const code = codeMatch?.[0] || "";
+    const normalizedQuery = normalizedSearchText(query);
+    const match =
+      (code ? rows.find((row) => String(row.SECURITY_CODE || "").slice(0, 6) === code) : null) ||
+      rows.find((row) => normalizedSearchText(row.SECURITY_NAME_ABBR) === normalizedQuery) ||
+      rows.find((row) => normalizedSearchText(row.SECURITY_NAME_ABBR).startsWith(normalizedQuery)) ||
+      (normalizedQuery.length >= 2
+        ? rows.find((row) => normalizedSearchText(row.SECURITY_NAME_ABBR).includes(normalizedQuery))
+        : null);
+    if (!match) {
+      missing.push({
+        query,
+        reason: "指定公司未在当前报告期 A股财报记录中匹配到，可能尚未披露本期财报"
+      });
+      continue;
+    }
+    const symbol = String(match.SECURITY_CODE || "").slice(0, 6);
+    const existing = matches.get(symbol) || { row: match, queries: [] };
+    existing.queries = sourceSet(...existing.queries, query);
+    matches.set(symbol, existing);
+  }
+  return { matches, missing };
+}
+
 async function getAshareRankings(force = false, options = parseRankingOptions()) {
   const startedAt = Date.now();
   const reportInfo = ashareReportInfo();
@@ -2252,6 +2400,7 @@ async function getAshareRankings(force = false, options = parseRankingOptions())
     }
   }
   const rows = [...deduped.values()];
+  const manualRows = resolveAshareRowQueries(rows, options.focusCompanyQueries);
   const quoteMap = await fetchAshareQuotes(rows.map((row) => row.SECUCODE), force);
   const cashFlowCurrentMap = options.includeCashFlow
     ? await fetchAshareCashFlowMap(reportInfo.date, force)
@@ -2262,11 +2411,16 @@ async function getAshareRankings(force = false, options = parseRankingOptions())
   const allRanked = rows
     .map((row) => {
       const code = String(row.SECURITY_CODE || "").slice(0, 6);
+      const manual = manualRows.matches.get(code);
       return ashareRowToRanking(
         row,
         quoteMap.get(code),
         options,
-        ashareCashFlowMetric(code, cashFlowCurrentMap, cashFlowPriorMap, row)
+        ashareCashFlowMetric(code, cashFlowCurrentMap, cashFlowPriorMap, row),
+        {
+          forced: Boolean(manual),
+          manualQueries: manual?.queries || []
+        }
       );
     })
     .sort((a, b) => {
@@ -2274,16 +2428,24 @@ async function getAshareRankings(force = false, options = parseRankingOptions())
       return String(b.filing.filingDate).localeCompare(String(a.filing.filingDate));
     });
   const positive = allRanked.filter((row) => row.score > 0);
-  const ranked = positive.slice(0, options.analysisLimit);
+  const rankedMap = new Map();
+  for (const row of positive.slice(0, options.analysisLimit)) rankedMap.set(row.symbol, row);
+  for (const row of allRanked.filter((item) => item.forced)) rankedMap.set(row.symbol, row);
+  const ranked = [...rankedMap.values()].sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return String(b.filing.filingDate).localeCompare(String(a.filing.filingDate));
+  });
   const diagnostics = {
     version: 1,
     counts: {
+      manualCompanyMissing: manualRows.missing.length,
       noPositiveScore: allRanked.length - positive.length,
-      notEnrichedDueLimit: Math.max(0, positive.length - ranked.length),
+      notEnrichedDueLimit: positive.filter((row) => !rankedMap.has(row.symbol) && !row.forced).length,
       marketDataMissing: rows.filter((row) => !quoteMap.has(String(row.SECURITY_CODE || "").slice(0, 6))).length,
       analysisCacheHits: 0,
       analysisCacheMisses: ranked.length
     },
+    manualCompanyMissing: manualRows.missing,
     marketDataMissing: rows
       .filter((row) => !quoteMap.has(String(row.SECURITY_CODE || "").slice(0, 6)))
       .slice(0, 500)
@@ -2302,16 +2464,21 @@ async function getAshareRankings(force = false, options = parseRankingOptions())
         name: row.name,
         filingDate: row.filing.filingDate,
         reportDate: row.filing.reportDate,
-        reason: "有财报数据，但未触发营收/归母净利/ROE/毛利率/现金流亮眼条件"
+        reason: row.forced
+          ? "指定公司已强制展示；有财报数据但未触发亮眼条件"
+          : "有财报数据，但未触发营收/归母净利/ROE/毛利率/现金流亮眼条件"
       })),
-    notEnrichedDueLimit: positive.slice(options.analysisLimit, options.analysisLimit + 500).map((row) => ({
-      symbol: row.symbol,
-      name: row.name,
-      filingDate: row.filing.filingDate,
-      reportDate: row.filing.reportDate,
-      metricScore: row.score,
-      reason: `超过本次分析数量 ${options.analysisLimit}，未展示在榜单中`
-    }))
+    notEnrichedDueLimit: positive
+      .filter((row) => !rankedMap.has(row.symbol) && !row.forced)
+      .slice(0, 500)
+      .map((row) => ({
+        symbol: row.symbol,
+        name: row.name,
+        filingDate: row.filing.filingDate,
+        reportDate: row.filing.reportDate,
+        metricScore: row.score,
+        reason: `超过本次分析数量 ${options.analysisLimit}，未展示在榜单中`
+      }))
   };
   const payload = {
     market: "cn",
@@ -2326,7 +2493,8 @@ async function getAshareRankings(force = false, options = parseRankingOptions())
       usesLLM: false,
       includeCashFlow: options.includeCashFlow,
       cashFlowThresholdPct: options.cashFlowThresholdPct,
-      customKeywordRules: options.customKeywordRules
+      customKeywordRules: options.customKeywordRules,
+      focusCompanyQueries: options.focusCompanyQueries
     },
     source: {
       filings: "东方财富数据中心 RPT_LICO_FN_CPD",
@@ -2341,6 +2509,7 @@ async function getAshareRankings(force = false, options = parseRankingOptions())
       selectedForAnalysis: ranked.length,
       enriched: ranked.length,
       ranked: ranked.length,
+      forced: ranked.filter((row) => row.forced).length,
       diagnostics: diagnostics.counts
     },
     diagnostics,

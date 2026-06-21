@@ -126,18 +126,27 @@ function readAnalysisOptions() {
     reuse: $("#reuse-analysis")?.checked !== false,
     cashFlow: $("#include-cash-flow")?.checked === true,
     cashFlowThreshold: Math.min(500, Math.max(0, Number($("#cash-flow-threshold")?.value || 25))),
+    focusCompanies: $("#focus-companies")?.value?.trim() || "",
     keywords: $("#custom-keywords")?.value?.trim() || ""
   };
 }
 
+function analysisOptionsStorageKey() {
+  return `earningsRadar.analysisOptions.${currentMarket()}`;
+}
+
 function persistAnalysisOptions() {
   const options = readAnalysisOptions();
-  localStorage.setItem("earningsRadar.analysisOptions", JSON.stringify(options));
+  localStorage.setItem(analysisOptionsStorageKey(), JSON.stringify(options));
 }
 
 function restoreAnalysisOptions() {
   try {
-    const options = JSON.parse(localStorage.getItem("earningsRadar.analysisOptions") || "{}");
+    const options = JSON.parse(
+      localStorage.getItem(analysisOptionsStorageKey()) ||
+        localStorage.getItem("earningsRadar.analysisOptions") ||
+        "{}"
+    );
     if (options.limit && $("#analysis-limit")) $("#analysis-limit").value = options.limit;
     if (typeof options.reuse === "boolean" && $("#reuse-analysis")) {
       $("#reuse-analysis").checked = options.reuse;
@@ -148,11 +157,14 @@ function restoreAnalysisOptions() {
     if (options.cashFlowThreshold != null && $("#cash-flow-threshold")) {
       $("#cash-flow-threshold").value = options.cashFlowThreshold;
     }
+    if (options.focusCompanies != null && $("#focus-companies")) {
+      $("#focus-companies").value = options.focusCompanies;
+    }
     if (options.keywords != null && $("#custom-keywords")) {
       $("#custom-keywords").value = options.keywords;
     }
   } catch {
-    localStorage.removeItem("earningsRadar.analysisOptions");
+    localStorage.removeItem(analysisOptionsStorageKey());
   }
 }
 
@@ -166,6 +178,7 @@ function rankingQuery(force = false) {
     params.set("cashFlow", "1");
     params.set("cashFlowThreshold", String(options.cashFlowThreshold));
   }
+  if (options.focusCompanies) params.set("focus", options.focusCompanies);
   if (options.keywords) params.set("keywords", options.keywords);
   return params.toString();
 }
@@ -179,6 +192,7 @@ function compactList(items, limit = 30) {
       const name = item.name ? ` ${escapeHtml(item.name)}` : "";
       const date = item.date ? `<strong>${escapeHtml(item.date)}</strong>` : "";
       const reason = item.reason ? ` — ${escapeHtml(item.reason)}` : "";
+      const query = item.query ? `指定：${escapeHtml(item.query)} ` : "";
       const detail = item.error ? `；错误：${escapeHtml(item.error)}` : "";
       const filing = item.filingDate ? `；披露：${escapeHtml(item.filingDate)}` : "";
       const frame = item.frame ? `；frame：${escapeHtml(item.frame)}` : "";
@@ -187,7 +201,7 @@ function compactList(items, limit = 30) {
       const calendarDates = item.calendarDates?.length
         ? `；日历：${escapeHtml(item.calendarDates.slice(0, 4).join(", "))}`
         : "";
-      return `<li>${date}${symbol}${name}${filing}${reason}${sources}${calendarDates}${frame}${concept}${detail}</li>`;
+      return `<li>${query}${date}${symbol}${name}${filing}${reason}${sources}${calendarDates}${frame}${concept}${detail}</li>`;
     })
     .join("");
   const more =
@@ -214,6 +228,7 @@ function renderDiagnostics(payload) {
     "calendarFetchFailures",
     "frameFetchFailures",
     "missingSymbols",
+    "manualCompanyMissing",
     "notEnrichedDueLimit",
     "marketDataMissing",
     "enrichFailures",
@@ -224,22 +239,24 @@ function renderDiagnostics(payload) {
   const hardIssues = diagnosticsTotal(counts, hardIssueKeys);
   const selected = payload.totals.selectedForAnalysis ?? payload.totals.enriched;
   if (payload.market === "cn") {
-    $("#coverage-summary").textContent = `A股 ${payload.reportingFrame?.label || payload.range.label} 财报记录 ${payload.totals.scanned} 条，亮眼候选 ${payload.totals.candidates} 家，本次展示 ${selected} 家，最终入榜 ${payload.totals.ranked} 家。`;
+    $("#coverage-summary").textContent = `A股 ${payload.reportingFrame?.label || payload.range.label} 财报记录 ${payload.totals.scanned} 条，亮眼候选 ${payload.totals.candidates} 家，指定分析 ${payload.totals.forced || 0} 家，本次展示 ${selected} 家，最终入榜 ${payload.totals.ranked} 家。`;
   } else {
     const staticCount = payload.totals.configured;
     const calendarCount = payload.totals.calendarSymbols ?? 0;
     const combinedCount = payload.totals.combinedUniverse ?? staticCount;
-    $("#coverage-summary").textContent = `静态股票池 ${staticCount} 家，当前披露窗口日历 ${calendarCount} 家，合并后 ${combinedCount} 家；SEC 匹配 ${payload.totals.scanned} 家，亮眼候选 ${payload.totals.candidates} 家，按日历/披露时间选取 ${selected} 家，实际解析财报 ${payload.totals.enriched} 家，最终入榜 ${payload.totals.ranked} 家。分析缓存：复用 ${counts.analysisCacheHits || 0}，新算 ${counts.analysisCacheMisses || 0}。`;
+    $("#coverage-summary").textContent = `静态股票池 ${staticCount} 家，当前披露窗口日历 ${calendarCount} 家，合并后 ${combinedCount} 家；SEC 匹配 ${payload.totals.scanned} 家，亮眼候选 ${payload.totals.candidates} 家，指定分析 ${payload.totals.forced || 0} 家，按日历/披露时间选取 ${selected} 家，实际解析财报 ${payload.totals.enriched} 家，最终入榜 ${payload.totals.ranked} 家。分析缓存：复用 ${counts.analysisCacheHits || 0}，新算 ${counts.analysisCacheMisses || 0}。`;
   }
   const badge = $("#diagnostics-badge");
   badge.textContent = hardIssues ? `${hardIssues} 个需检查项` : "无接口/解析失败";
   badge.classList.toggle("has-issues", hardIssues > 0);
 
   const categories = payload.market === "cn" ? [
+    ["manualCompanyMissing", "指定公司未匹配", "failure"],
     ["marketDataMissing", "估值/市值数据缺失", "failure"],
     ["notEnrichedDueLimit", "候选超过展示上限", "failure"],
     ["noPositiveScore", "有数据但未触发亮眼条件", "neutral"]
   ] : [
+    ["manualCompanyMissing", "指定公司未匹配", "failure"],
     ["calendarFetchFailures", "Nasdaq 日历接口失败", "failure"],
     ["frameFetchFailures", "SEC frames 接口失败", "failure"],
     ["frameConceptUnavailable", "SEC frames 指标无聚合数据", "notice"],
@@ -405,6 +422,7 @@ function renderRanking(payload, options = {}) {
             <a href="${escapeHtml(row.stockUrl)}" target="_blank" rel="noreferrer">${escapeHtml(
         row.symbol
       )}</a>
+            ${row.forced ? '<span class="manual-badge">指定</span>' : ""}
             ${row.highlight ? '<span class="hot-badge">高景气</span>' : ""}
           </div>
           <div class="muted">${escapeHtml(row.name)}</div>
@@ -456,9 +474,10 @@ async function loadRanking(force = false) {
     const payload = await fetchJson(`${rankingEndpoint()}${query ? `?${query}` : ""}`);
     renderRanking(payload);
     const timing = payload.cache === "hit" ? "命中缓存" : `用时 ${(payload.elapsedMs / 1000).toFixed(1)} 秒`;
+    const forcedText = payload.totals.forced ? `，指定分析 ${payload.totals.forced} 家` : "";
     setStatus(
       "#ranking-status",
-      `完成：${payload.totals.ranked} 家入榜，${timing}。`,
+      `完成：${payload.totals.ranked} 家入榜${forcedText}，${timing}。`,
       "ok"
     );
   } catch (error) {
@@ -802,7 +821,7 @@ function initRanking() {
   $("#refresh-ranking").addEventListener("click", () => loadRanking(true));
   $("#apply-ranking")?.addEventListener("click", () => loadRanking(false));
   restoreAnalysisOptions();
-  ["analysis-limit", "reuse-analysis", "include-cash-flow", "cash-flow-threshold", "custom-keywords"].forEach((id) => {
+  ["analysis-limit", "reuse-analysis", "include-cash-flow", "cash-flow-threshold", "focus-companies", "custom-keywords"].forEach((id) => {
     const element = document.getElementById(id);
     if (element) element.addEventListener("change", persistAnalysisOptions);
   });
