@@ -232,6 +232,12 @@ input {
   min-width: 0;
 }
 
+.analysis-controls > .control-actions {
+  display: flex;
+  grid-column: span 2;
+  align-items: end;
+}
+
 .control-field,
 .keyword-field {
   display: grid;
@@ -283,8 +289,13 @@ input {
 }
 
 .keyword-field {
-  grid-column: span 8;
+  grid-column: span 6;
   min-width: 0;
+}
+
+.controls-apply-button {
+  width: 100%;
+  min-height: 38px;
 }
 
 .summary-grid {
@@ -892,7 +903,8 @@ button.calendar-cell {
   }
 
   .analysis-controls > .focus-field,
-  .keyword-field {
+  .keyword-field,
+  .analysis-controls > .control-actions {
     grid-column: span 6;
   }
 }
@@ -928,7 +940,8 @@ button.calendar-cell {
   .analysis-controls > .control-field,
   .analysis-controls > .checkbox-field,
   .focus-field,
-  .keyword-field {
+  .keyword-field,
+  .analysis-controls > .control-actions {
     grid-column: 1 / -1;
   }
 

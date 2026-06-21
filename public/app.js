@@ -456,9 +456,11 @@ function renderRanking(payload, options = {}) {
 
 async function loadRanking(force = false) {
   const button = $("#refresh-ranking");
-  const applyButton = $("#apply-ranking");
+  const applyButtons = [$("#apply-ranking"), $("#apply-ranking-inline")].filter(Boolean);
   button.disabled = true;
-  if (applyButton) applyButton.disabled = true;
+  applyButtons.forEach((applyButton) => {
+    applyButton.disabled = true;
+  });
   button.classList.add("loading");
   setStatus(
     "#ranking-status",
@@ -484,7 +486,9 @@ async function loadRanking(force = false) {
     setStatus("#ranking-status", `刷新失败：${error.message}`, "error");
   } finally {
     button.disabled = false;
-    if (applyButton) applyButton.disabled = false;
+    applyButtons.forEach((applyButton) => {
+      applyButton.disabled = false;
+    });
     button.classList.remove("loading");
   }
 }
@@ -820,10 +824,17 @@ async function loadCalendar(force = false) {
 function initRanking() {
   $("#refresh-ranking").addEventListener("click", () => loadRanking(true));
   $("#apply-ranking")?.addEventListener("click", () => loadRanking(false));
+  $("#apply-ranking-inline")?.addEventListener("click", () => loadRanking(false));
   restoreAnalysisOptions();
   ["analysis-limit", "reuse-analysis", "include-cash-flow", "cash-flow-threshold", "focus-companies", "custom-keywords"].forEach((id) => {
     const element = document.getElementById(id);
     if (element) element.addEventListener("change", persistAnalysisOptions);
+  });
+  $("#focus-companies")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void loadRanking(false);
+    }
   });
   document.querySelectorAll("[data-sort-key]").forEach((button) => {
     button.addEventListener("click", () => setRankingSort(button.dataset.sortKey));
