@@ -343,13 +343,13 @@ input {
 }
 
 .diagnostics-panel {
-  display: grid;
-  gap: 14px;
-  margin: 10px 0 16px;
-  padding: 16px;
+  display: block;
+  margin: 14px 0 4px;
+  padding: 0;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
+  overflow: hidden;
 }
 
 .diagnostics-panel[hidden] {
@@ -358,23 +358,48 @@ input {
 
 .diagnostics-header {
   display: flex;
-  align-items: flex-start;
+  cursor: pointer;
+  align-items: center;
   justify-content: space-between;
   gap: 16px;
+  padding: 14px 16px;
+  list-style: none;
 }
 
-.diagnostics-header h2 {
-  margin: 0 0 6px;
+.diagnostics-header::-webkit-details-marker {
+  display: none;
+}
+
+.diagnostics-header::marker {
+  content: "";
+}
+
+.diagnostics-title {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.diagnostics-heading {
   font-size: 18px;
+  font-weight: 820;
   letter-spacing: 0;
 }
 
-.diagnostics-header p,
+#coverage-summary,
 .criteria-grid p {
+  display: block;
   margin: 0;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.45;
+}
+
+.diagnostics-header-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
 }
 
 .diagnostics-badge {
@@ -393,6 +418,34 @@ input {
 .diagnostics-badge.has-issues {
   background: var(--amber-soft);
   color: var(--amber);
+}
+
+.diagnostics-toggle {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  padding: 4px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  color: var(--slate);
+  font-size: 12px;
+  font-weight: 760;
+  white-space: nowrap;
+}
+
+.diagnostics-toggle::before {
+  content: "展开";
+}
+
+.diagnostics-panel[open] .diagnostics-toggle::before {
+  content: "收起";
+}
+
+.diagnostics-body {
+  display: grid;
+  gap: 14px;
+  padding: 0 16px 16px;
 }
 
 .criteria-grid {
@@ -935,6 +988,17 @@ button.calendar-cell {
   .criteria-grid,
   .calendar-layout {
     grid-template-columns: 1fr;
+  }
+
+  .diagnostics-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .diagnostics-header-actions {
+    width: 100%;
+    justify-content: space-between;
   }
 
   .analysis-controls > .control-field,

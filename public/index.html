@@ -38,6 +38,39 @@
         </div>
       </section>
 
+      <details class="diagnostics-panel" id="diagnostics-panel" hidden>
+        <summary class="diagnostics-header">
+          <span class="diagnostics-title">
+            <span class="diagnostics-heading">覆盖与异常</span>
+            <span id="coverage-summary"></span>
+          </span>
+          <span class="diagnostics-header-actions">
+            <span class="diagnostics-badge" id="diagnostics-badge">--</span>
+            <span class="diagnostics-toggle" aria-hidden="true"></span>
+          </span>
+        </summary>
+        <div class="diagnostics-body">
+          <div class="criteria-grid" aria-label="筛选口径">
+            <div>
+              <span>候选来源</span>
+              <strong>静态池 + 财报日历</strong>
+              <p>当前披露窗口内所有 Nasdaq 日历公司都会进入首页扫描池。</p>
+            </div>
+            <div>
+              <span>分析顺序</span>
+              <strong>日历/披露时间优先</strong>
+              <p>先按日历日期和披露日期排序，再分析你设置的候选数量。</p>
+            </div>
+            <div>
+              <span>文本方法</span>
+              <strong>规则匹配</strong>
+              <p>扫描 SEC 主文档关键词/正则，不调用大模型。</p>
+            </div>
+          </div>
+          <div class="diagnostics-lists" id="diagnostics-lists"></div>
+        </div>
+      </details>
+
       <section class="analysis-controls" aria-label="分析设置">
         <label class="control-field">
           <span>分析候选数</span>
@@ -92,34 +125,6 @@
       </section>
 
       <section class="status-line" id="ranking-status" role="status"></section>
-
-      <section class="diagnostics-panel" id="diagnostics-panel" hidden>
-        <div class="diagnostics-header">
-          <div>
-            <h2>覆盖与异常</h2>
-            <p id="coverage-summary"></p>
-          </div>
-          <span class="diagnostics-badge" id="diagnostics-badge">--</span>
-        </div>
-        <div class="criteria-grid" aria-label="筛选口径">
-          <div>
-            <span>候选来源</span>
-            <strong>静态池 + 财报日历</strong>
-            <p>当前披露窗口内所有 Nasdaq 日历公司都会进入首页扫描池。</p>
-          </div>
-          <div>
-            <span>分析顺序</span>
-            <strong>日历/披露时间优先</strong>
-            <p>先按日历日期和披露日期排序，再分析你设置的候选数量。</p>
-          </div>
-          <div>
-            <span>文本方法</span>
-            <strong>规则匹配</strong>
-            <p>扫描 SEC 主文档关键词/正则，不调用大模型。</p>
-          </div>
-        </div>
-        <div class="diagnostics-lists" id="diagnostics-lists"></div>
-      </section>
 
       <section class="table-panel">
         <div class="table-scroll">
