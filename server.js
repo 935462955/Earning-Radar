@@ -22,7 +22,7 @@ const TEXT_SCAN_MIN_SCORE = Number(process.env.TEXT_SCAN_MIN_SCORE || 20);
 const ENRICH_LIMIT = Number(process.env.ENRICH_LIMIT || 100);
 const RANKING_DIAGNOSTICS_VERSION = 8;
 const SIGNAL_PATTERN_VERSION = 2;
-const ASHARE_DATA_FILTER_VERSION = 2;
+const ASHARE_DATA_FILTER_VERSION = 3;
 
 const RESULT_FORMS = new Set(["10-Q", "10-K", "20-F", "40-F"]);
 const TEXT_FORMS = new Set([
@@ -318,6 +318,20 @@ function eastmoneyDataUrl(reportName, params = {}) {
     ...params
   });
   return `https://datacenter-web.eastmoney.com/api/data/v1/get?${query.toString()}`;
+}
+
+function eastmoneyAnnouncementUrl(params = {}) {
+  const query = new URLSearchParams({
+    sr: "-1",
+    page_size: "100",
+    page_index: "1",
+    ann_type: "A",
+    client_source: "web",
+    f_node: "0",
+    s_node: "0",
+    ...params
+  });
+  return `https://np-anotice-stock.eastmoney.com/api/security/ann?${query.toString()}`;
 }
 
 async function fetchEastmoneyPaged(reportName, params = {}, force = false) {
@@ -2065,6 +2079,143 @@ function ashareReportUrl(secucode) {
   )}${code}`;
 }
 
+function ashareReportPdfUrl(artCode) {
+  return `https://pdf.dfcfw.com/pdf/H2_${encodeURIComponent(artCode)}_1.pdf`;
+}
+
+function ashareNoticePageUrl(artCode) {
+  return `https://np-info.eastmoney.com/wap/notice/?infocode=${encodeURIComponent(artCode)}`;
+}
+
+function ashareNoticeInput(item) {
+  const filing = item?.filing || {};
+  const code = String(item?.SECURITY_CODE || item?.symbol || "").slice(0, 6);
+  const secucode = item?.SECUCODE || filing.accessionNumber || item?.secucode || "";
+  const filingDate = ashareDate(item?.NOTICE_DATE || filing.filingDate || item?.filingDate || item?.date);
+  const reportDate = ashareDate(item?.REPORTDATE || filing.reportDate || item?.reportDate);
+  if (!code || !filingDate) return null;
+  return { code, secucode, filingDate, reportDate };
+}
+
+function ashareNoticeKey(item) {
+  const input = ashareNoticeInput(item);
+  if (!input) return "";
+  return `${input.code}:${input.filingDate}:${input.reportDate || ""}`;
+}
+
+function ashareReportPeriodPattern(reportDate) {
+  const value = ashareDate(reportDate);
+  const monthDay = value.slice(5);
+  if (monthDay === "03-31") return /(?:一季度|第一季度|1季度|一季报|Q1)[^，。；;:：]{0,12}报告/i;
+  if (monthDay === "06-30") return /(?:半年度|中期|半年报)[^，。；;:：]{0,12}报告/i;
+  if (monthDay === "09-30") return /(?:三季度|第三季度|3季度|三季报|Q3)[^，。；;:：]{0,12}报告/i;
+  if (monthDay === "12-31") return /(?:年度|年报)[^，。；;:：]{0,12}报告/i;
+  return /(?:季度|半年度|年度|季报|年报)[^，。；;:：]{0,12}报告/i;
+}
+
+function ashareNoticeText(notice) {
+  return [
+    notice?.title,
+    notice?.title_ch,
+    ...(notice?.columns || []).map((column) => column.column_name)
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function scoreAshareReportNotice(notice, input) {
+  const text = ashareNoticeText(notice);
+  if (!text || !notice?.art_code) return null;
+  if (/业绩预告|业绩快报|业绩说明会|主要经营数据|问询函|回复|摘要取消|更正|修订|临时公告|提示性公告/.test(text)) {
+    return null;
+  }
+  const periodPattern = ashareReportPeriodPattern(input.reportDate);
+  if (!periodPattern.test(text)) return null;
+
+  const noticeDate = ashareDate(notice.notice_date || notice.display_time || notice.sort_date);
+  if (input.filingDate && noticeDate && noticeDate !== input.filingDate) return null;
+
+  let score = 0;
+  if (noticeDate === input.filingDate) score += 50;
+  const reportYear = String(input.reportDate || "").slice(0, 4);
+  if (reportYear && text.includes(`${reportYear}年`)) score += 20;
+  if (/报告全文|年度报告全文|一季度报告全文|半年度报告全文|三季度报告全文/.test(text)) score += 10;
+  if (/摘要/.test(text)) score -= 15;
+  if (/英文版|英文/.test(text)) score -= 20;
+  return score;
+}
+
+async function fetchAshareReportNoticeMap(items, force = false) {
+  const inputs = items.map(ashareNoticeInput).filter(Boolean);
+  if (!inputs.length) return new Map();
+
+  const byCode = new Map();
+  for (const input of inputs) {
+    if (!byCode.has(input.code)) byCode.set(input.code, []);
+    byCode.get(input.code).push(input);
+  }
+  const dates = inputs.map((input) => parseDate(input.filingDate)).filter(Boolean);
+  if (!dates.length) return new Map();
+  const beginDate = addDays(new Date(Math.min(...dates.map((date) => date.getTime()))), -1);
+  const endDate = addDays(new Date(Math.max(...dates.map((date) => date.getTime()))), 1);
+  const begin = toDateOnly(beginDate);
+  const end = toDateOnly(endDate);
+  const codes = [...byCode.keys()];
+  const chunks = [];
+  for (let index = 0; index < codes.length; index += 80) {
+    chunks.push(codes.slice(index, index + 80));
+  }
+
+  const pages = await mapLimit(chunks, 3, async (chunk) => {
+    const pageSize = 100;
+    const base = {
+      page_size: String(pageSize),
+      stock_list: chunk.join(","),
+      begin_time: begin,
+      end_time: end
+    };
+    const first = await cachedEastmoneyJson(eastmoneyAnnouncementUrl({ ...base, page_index: "1" }), force);
+    const notices = [...(first?.data?.list || [])];
+    const total = Number(first?.data?.total_hits || notices.length);
+    const pageCount = Math.min(Math.ceil(total / pageSize), 8);
+    if (pageCount > 1) {
+      const rest = await mapLimit(
+        Array.from({ length: pageCount - 1 }, (_, index) => index + 2),
+        3,
+        (pageIndex) =>
+          cachedEastmoneyJson(
+            eastmoneyAnnouncementUrl({ ...base, page_index: String(pageIndex) }),
+            force
+          )
+      );
+      for (const page of rest) notices.push(...(page?.data?.list || []));
+    }
+    return notices;
+  });
+
+  const bestByKey = new Map();
+  for (const notice of pages.flat()) {
+    const noticeCodes = (notice.codes || []).map((item) => String(item.stock_code || "").slice(0, 6));
+    for (const code of noticeCodes) {
+      for (const input of byCode.get(code) || []) {
+        const score = scoreAshareReportNotice(notice, input);
+        if (score == null) continue;
+        const key = `${input.code}:${input.filingDate}:${input.reportDate || ""}`;
+        const current = bestByKey.get(key);
+        if (current && current.score >= score) continue;
+        bestByKey.set(key, {
+          score,
+          artCode: notice.art_code,
+          title: notice.title_ch || notice.title || "",
+          noticePageUrl: ashareNoticePageUrl(notice.art_code),
+          pdfUrl: ashareReportPdfUrl(notice.art_code)
+        });
+      }
+    }
+  }
+  return bestByKey;
+}
+
 function ashareMoney(value) {
   if (!Number.isFinite(Number(value))) return "";
   return formatNumber(Number(value));
@@ -2444,6 +2595,15 @@ async function getAshareRankings(force = false, options = parseRankingOptions())
     if (b.score !== a.score) return b.score - a.score;
     return String(b.filing.filingDate).localeCompare(String(a.filing.filingDate));
   });
+  const noticeMap = await fetchAshareReportNoticeMap(ranked, force);
+  for (const row of ranked) {
+    const notice = noticeMap.get(ashareNoticeKey(row));
+    if (!notice) continue;
+    row.filing.url = notice.pdfUrl;
+    row.filing.noticePageUrl = notice.noticePageUrl;
+    row.filing.primaryDocument = notice.title;
+    row.filing.accessionNumber = notice.artCode;
+  }
   const diagnostics = {
     version: 1,
     counts: {
@@ -2560,11 +2720,13 @@ async function getAshareCalendar(month, force = false) {
   }
   const rows = [...calendarRowsByCompany.values()];
   const quoteMap = await fetchAshareQuotes(rows.map((row) => row.SECUCODE), force);
+  const noticeMap = await fetchAshareReportNoticeMap(rows, force);
   const byDate = {};
   for (const row of rows) {
     const date = ashareDate(row.NOTICE_DATE);
     const quote = quoteMap.get(row.SECURITY_CODE) || {};
     const secucode = row.SECUCODE;
+    const notice = noticeMap.get(ashareNoticeKey(row));
     const event = {
       date,
       symbol: row.SECURITY_CODE,
@@ -2580,8 +2742,11 @@ async function getAshareCalendar(month, force = false) {
       lastYearEPS: "",
       industry: quote.industry || row.BOARD_NAME || row.PUBLISHNAME || "",
       stockUrl: ashareStockUrl(secucode),
-      nasdaqUrl: ashareReportUrl(secucode),
-      calendarLabel: "财报页"
+      nasdaqUrl: notice?.pdfUrl || ashareReportUrl(secucode),
+      reportNoticeUrl: notice?.noticePageUrl || "",
+      reportTitle: notice?.title || "",
+      reportDate: ashareDate(row.REPORTDATE),
+      calendarLabel: notice ? "财报PDF" : "财报页"
     };
     if (!byDate[date]) byDate[date] = [];
     byDate[date].push(event);
