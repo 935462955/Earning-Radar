@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>财务报表分析</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body data-page="financials" data-market="us">
+    <header class="topbar">
+      <a class="brand" href="/">
+        <span class="brand-mark">ER</span>
+        <span>财报雷达</span>
+      </a>
+      <nav class="nav-tabs" aria-label="主导航">
+        <a href="/">美股排名</a>
+        <a href="/calendar.html">美股日历</a>
+        <a href="/ashare.html">A股排名</a>
+        <a href="/ashare-calendar.html">A股日历</a>
+      </nav>
+    </header>
+
+    <main class="shell">
+      <section class="toolbar">
+        <div>
+          <h1 id="financial-title">财务报表分析</h1>
+          <p id="financial-subtitle">等待读取</p>
+        </div>
+        <div class="actions">
+          <button class="primary-button" id="refresh-financials" type="button">
+            <span aria-hidden="true">↻</span>
+            刷新数据
+          </button>
+        </div>
+      </section>
+
+      <section class="summary-grid" id="financial-summary" aria-label="核心指标">
+        <div class="summary-item"><span>营收</span><strong>--</strong></div>
+        <div class="summary-item"><span>净利润</span><strong>--</strong></div>
+        <div class="summary-item"><span>经营现金流</span><strong>--</strong></div>
+        <div class="summary-item"><span>资产负债率</span><strong>--</strong></div>
+      </section>
+
+      <section class="status-line" id="financial-status" role="status"></section>
+      <section class="financial-charts" id="financial-charts" aria-label="财务图表"></section>
+      <div id="financial-table"></div>
+    </main>
+  </body>
+</html>

@@ -35,6 +35,15 @@ function companyProfilesEndpoint() {
   return isAshareMarket() ? "/api/ashare-company-profiles" : "/api/company-profiles";
 }
 
+function financialsUrl(symbol, market = currentMarket(), name = "") {
+  const params = new URLSearchParams({
+    market,
+    symbol: symbol || ""
+  });
+  if (name) params.set("name", name);
+  return `/financials.html?${params.toString()}`;
+}
+
 function formatDateTime(value) {
   if (!value) return "--";
   return new Intl.DateTimeFormat("zh-CN", {
@@ -502,6 +511,7 @@ function renderRanking(payload, options = {}) {
         <td class="link-cell">
           <a href="${escapeHtml(row.stockUrl)}" target="_blank" rel="noreferrer">股票页</a>
           <a href="${escapeHtml(row.filing.url)}" target="_blank" rel="noreferrer">财报</a>
+          <a href="${escapeHtml(financialsUrl(row.symbol, payload.market, row.name))}" target="_blank" rel="noreferrer">财务分析</a>
         </td>
       </tr>`;
     })
@@ -765,6 +775,7 @@ function renderDayPanel(date) {
           <a href="${escapeHtml(item.nasdaqUrl)}" target="_blank" rel="noreferrer">${escapeHtml(
             item.calendarLabel || "日历页"
           )}</a>
+          <a href="${escapeHtml(financialsUrl(item.symbol, currentMarket(), item.name))}" target="_blank" rel="noreferrer">财务分析</a>
         </div>
       </article>`;
       }
@@ -879,6 +890,272 @@ async function loadCalendar(force = false) {
   }
 }
 
+function financialPageParams() {
+  const params = new URLSearchParams(window.location.search);
+  return {
+    market: params.get("market") === "cn" ? "cn" : "us",
+    symbol: params.get("symbol") || "",
+    name: params.get("name") || ""
+  };
+}
+
+function financialMetricMap(payload) {
+  return Object.fromEntries((payload.metrics || []).map((metric) => [metric.key, metric]));
+}
+
+function financialValue(point, key) {
+  const value = point?.[key];
+  return Number.isFinite(Number(value)) ? Number(value) : null;
+}
+
+function compactNumber(value, digits = 2) {
+  if (!Number.isFinite(value)) return "--";
+  return Number(value).toLocaleString("zh-CN", {
+    maximumFractionDigits: digits,
+    minimumFractionDigits: Math.abs(value) >= 100 ? 0 : 1
+  });
+}
+
+function formatFinancialValue(value, payload, unit = "money") {
+  if (value == null || Number.isNaN(Number(value))) return "--";
+  if (unit === "percent") return pct(Number(value));
+  if (unit === "ratio") return `${compactNumber(Number(value), 2)}x`;
+  return `${compactNumber(Number(value) / (payload.unitDivisor || 1), 2)}${payload.unitLabel || ""}`;
+}
+
+function yoyValue(points, index, key) {
+  if (index <= 0) return null;
+  const current = financialValue(points[index], key);
+  const prior = financialValue(points[index - 1], key);
+  if (current == null || prior == null || Math.abs(prior) < 1) return null;
+  return (current - prior) / Math.abs(prior);
+}
+
+function chartColor(index) {
+  return ["#2563eb", "#0f9f6e", "#c98500", "#7c3aed", "#ef4444", "#0891b2"][index % 6];
+}
+
+function renderFinancialCards(payload) {
+  const points = payload.annual || [];
+  const latest = points[points.length - 1] || {};
+  const metricMap = financialMetricMap(payload);
+  const cards = ["revenue", "netIncome", "operatingCashFlow", "debtAssetRatio"].map((key) => {
+    const metric = metricMap[key] || { label: key, unit: "money" };
+    const value = financialValue(latest, key);
+    const growth = yoyValue(points, points.length - 1, key);
+    const growthClass = growth == null ? "muted" : growth >= 0 ? "good" : "bad";
+    return `<div class="summary-item financial-summary-item">
+      <span>${escapeHtml(metric.label)}</span>
+      <strong>${formatFinancialValue(value, payload, metric.unit)}</strong>
+      <small class="${growthClass}">同比 ${growth == null ? "--" : pct(growth)}</small>
+    </div>`;
+  });
+  $("#financial-summary").innerHTML = cards.join("");
+}
+
+function chartLegend(keys, metricMap) {
+  return `<div class="chart-legend">${keys
+    .map(
+      (key, index) =>
+        `<span><i style="background:${chartColor(index)}"></i>${escapeHtml(metricMap[key]?.label || key)}</span>`
+    )
+    .join("")}</div>`;
+}
+
+function renderBarChart(title, payload, points, keys) {
+  const metricMap = financialMetricMap(payload);
+  const width = 760;
+  const height = 260;
+  const left = 48;
+  const right = 18;
+  const top = 18;
+  const bottom = 38;
+  const chartWidth = width - left - right;
+  const chartHeight = height - top - bottom;
+  const values = points.flatMap((point) => keys.map((key) => Math.max(0, financialValue(point, key) || 0)));
+  const max = Math.max(...values, 1);
+  const groupWidth = chartWidth / Math.max(points.length, 1);
+  const barWidth = Math.max(4, Math.min(24, (groupWidth * 0.72) / keys.length));
+  const bars = points
+    .flatMap((point, pointIndex) =>
+      keys.map((key, keyIndex) => {
+        const raw = Math.max(0, financialValue(point, key) || 0);
+        const scaled = raw / max;
+        const x = left + pointIndex * groupWidth + (groupWidth - barWidth * keys.length) / 2 + keyIndex * barWidth;
+        const h = scaled * chartHeight;
+        const y = top + chartHeight - h;
+        return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(2, barWidth - 2).toFixed(
+          1
+        )}" height="${h.toFixed(1)}" rx="3" fill="${chartColor(keyIndex)}">
+          <title>${point.year} ${metricMap[key]?.label || key}: ${formatFinancialValue(raw, payload, metricMap[key]?.unit)}</title>
+        </rect>`;
+      })
+    )
+    .join("");
+  const labels = points
+    .map((point, index) => {
+      const x = left + index * groupWidth + groupWidth / 2;
+      return `<text x="${x.toFixed(1)}" y="${height - 12}" text-anchor="middle">${point.year}</text>`;
+    })
+    .join("");
+  return `<section class="chart-card">
+    <div class="chart-heading"><h2>${escapeHtml(title)}</h2>${chartLegend(keys, metricMap)}</div>
+    <svg class="financial-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}">
+      <line x1="${left}" y1="${top + chartHeight}" x2="${width - right}" y2="${top + chartHeight}" />
+      <text x="${left}" y="12">${escapeHtml(formatFinancialValue(max, payload, "money"))}</text>
+      ${bars}
+      <g class="chart-axis">${labels}</g>
+    </svg>
+  </section>`;
+}
+
+function renderLineChart(title, payload, points, keys) {
+  const metricMap = financialMetricMap(payload);
+  const width = 760;
+  const height = 260;
+  const left = 48;
+  const right = 18;
+  const top = 18;
+  const bottom = 38;
+  const chartWidth = width - left - right;
+  const chartHeight = height - top - bottom;
+  const values = points.flatMap((point) => keys.map((key) => financialValue(point, key))).filter((value) => value != null);
+  if (!values.length) {
+    return `<section class="chart-card"><div class="chart-heading"><h2>${escapeHtml(title)}</h2></div><div class="empty-cell">暂无可绘制数据。</div></section>`;
+  }
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  if (min > 0) min = 0;
+  if (max === min) max += 1;
+  const yFor = (value) => top + (1 - (value - min) / (max - min)) * chartHeight;
+  const xFor = (index) => left + (points.length <= 1 ? chartWidth / 2 : (index / (points.length - 1)) * chartWidth);
+  const lines = keys
+    .map((key, keyIndex) => {
+      const coordinates = points
+        .map((point, index) => {
+          const value = financialValue(point, key);
+          if (value == null) return null;
+          return `${xFor(index).toFixed(1)},${yFor(value).toFixed(1)}`;
+        })
+        .filter(Boolean);
+      if (coordinates.length < 2) return "";
+      return `<polyline points="${coordinates.join(" ")}" fill="none" stroke="${chartColor(keyIndex)}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />`;
+    })
+    .join("");
+  const dots = keys
+    .flatMap((key, keyIndex) =>
+      points.map((point, index) => {
+        const value = financialValue(point, key);
+        if (value == null) return "";
+        return `<circle cx="${xFor(index).toFixed(1)}" cy="${yFor(value).toFixed(1)}" r="3.5" fill="${chartColor(
+          keyIndex
+        )}"><title>${point.year} ${metricMap[key]?.label || key}: ${formatFinancialValue(
+          value,
+          payload,
+          metricMap[key]?.unit
+        )}</title></circle>`;
+      })
+    )
+    .join("");
+  const labels = points
+    .map((point, index) => `<text x="${xFor(index).toFixed(1)}" y="${height - 12}" text-anchor="middle">${point.year}</text>`)
+    .join("");
+  return `<section class="chart-card">
+    <div class="chart-heading"><h2>${escapeHtml(title)}</h2>${chartLegend(keys, metricMap)}</div>
+    <svg class="financial-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}">
+      <line x1="${left}" y1="${top + chartHeight}" x2="${width - right}" y2="${top + chartHeight}" />
+      <line x1="${left}" y1="${top}" x2="${left}" y2="${top + chartHeight}" />
+      <text x="${left}" y="12">${escapeHtml(formatFinancialValue(max, payload, metricMap[keys[0]]?.unit))}</text>
+      <text x="${left}" y="${top + chartHeight - 4}">${escapeHtml(formatFinancialValue(min, payload, metricMap[keys[0]]?.unit))}</text>
+      ${lines}
+      ${dots}
+      <g class="chart-axis">${labels}</g>
+    </svg>
+  </section>`;
+}
+
+function renderFinancialTable(payload, points) {
+  const metricMap = financialMetricMap(payload);
+  const columns = ["revenue", "netIncome", "operatingCashFlow", "contractLiabilities", "accountsReceivable", "inventory", "debtAssetRatio"];
+  return `<section class="table-panel financial-table-panel">
+    <div class="table-scroll">
+      <table class="ranking-table">
+        <thead>
+          <tr><th>年份</th>${columns.map((key) => `<th>${escapeHtml(metricMap[key]?.label || key)}</th>`).join("")}</tr>
+        </thead>
+        <tbody>
+          ${[...points]
+            .reverse()
+            .map(
+              (point) =>
+                `<tr><td>${escapeHtml(point.year)}</td>${columns
+                  .map((key) => `<td>${formatFinancialValue(financialValue(point, key), payload, metricMap[key]?.unit)}</td>`)
+                  .join("")}</tr>`
+            )
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  </section>`;
+}
+
+function renderFinancials(payload) {
+  const points = (payload.annual || []).filter((point) => point.year).slice(-8);
+  const name = payload.name || financialPageParams().name || payload.symbol;
+  $("#financial-title").textContent = `${payload.symbol} ${name}`;
+  $("#financial-subtitle").textContent = `${payload.market === "cn" ? "A股" : "美股"} | ${payload.source} | 更新 ${formatDateTime(
+    payload.generatedAt
+  )}`;
+  renderFinancialCards(payload);
+  if (!points.length) {
+    $("#financial-charts").innerHTML = '<div class="empty-cell">暂无历史财务数据。</div>';
+    $("#financial-table").innerHTML = "";
+    return;
+  }
+  $("#financial-charts").innerHTML = [
+    renderBarChart("营收与利润", payload, points, ["revenue", "netIncome", "operatingProfit"]),
+    renderLineChart("现金流与预收/合同负债", payload, points, ["operatingCashFlow", "contractLiabilities"]),
+    renderBarChart("资产质量", payload, points, ["accountsReceivable", "inventory", "contractLiabilities"]),
+    renderLineChart("资产负债率", payload, points, ["debtAssetRatio"])
+  ].join("");
+  $("#financial-table").innerHTML = renderFinancialTable(payload, points);
+}
+
+async function loadFinancials(force = false) {
+  const params = financialPageParams();
+  const button = $("#refresh-financials");
+  if (button) {
+    button.disabled = true;
+    button.classList.add("loading");
+  }
+  setStatus("#financial-status", force ? "正在刷新财务报表数据..." : "正在读取财务报表数据...");
+  try {
+    const payload = await fetchJson(
+      `/api/financials?market=${encodeURIComponent(params.market)}&symbol=${encodeURIComponent(params.symbol)}${force ? "&force=1" : ""}`
+    );
+    renderFinancials(payload);
+    setStatus("#financial-status", `完成：读取 ${payload.annual?.length || 0} 年数据。`, "ok");
+  } catch (error) {
+    setStatus("#financial-status", `读取失败：${error.message}`, "error");
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.classList.remove("loading");
+    }
+  }
+}
+
+function initFinancials() {
+  const params = financialPageParams();
+  document.body.dataset.market = params.market;
+  if (!params.symbol) {
+    setStatus("#financial-status", "缺少公司代码。", "error");
+    return;
+  }
+  $("#refresh-financials")?.addEventListener("click", () => loadFinancials(true));
+  loadFinancials(false);
+}
+
 function initRanking() {
   $("#refresh-ranking").addEventListener("click", () => loadRanking(true));
   $("#apply-ranking")?.addEventListener("click", () => loadRanking(false));
@@ -925,4 +1202,5 @@ document.addEventListener("DOMContentLoaded", () => {
   const page = document.body.dataset.page;
   if (page === "ranking") initRanking();
   if (page === "calendar") initCalendar();
+  if (page === "financials") initFinancials();
 });

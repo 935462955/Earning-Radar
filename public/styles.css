@@ -327,6 +327,17 @@ input {
   letter-spacing: 0;
 }
 
+.financial-summary-item {
+  display: grid;
+  align-content: center;
+}
+
+.financial-summary-item small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 720;
+}
+
 .status-line {
   min-height: 32px;
   margin: 8px 0 12px;
@@ -945,6 +956,84 @@ button.calendar-cell {
   cursor: default;
 }
 
+.financial-charts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin: 14px 0;
+}
+
+.chart-card {
+  min-width: 0;
+  overflow-x: auto;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.chart-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.chart-heading h2 {
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: 0;
+}
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.chart-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.chart-legend i {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+}
+
+.financial-chart {
+  width: 100%;
+  min-width: 520px;
+  height: auto;
+  overflow: visible;
+}
+
+.financial-chart line {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.financial-chart text {
+  fill: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.chart-axis text {
+  fill: var(--slate);
+}
+
+.financial-table-panel {
+  margin-top: 14px;
+}
+
 @media (max-width: 1320px) {
   .analysis-controls {
     grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -986,6 +1075,7 @@ button.calendar-cell {
   .summary-grid,
   .analysis-controls,
   .criteria-grid,
+  .financial-charts,
   .calendar-layout {
     grid-template-columns: 1fr;
   }

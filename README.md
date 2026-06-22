@@ -17,6 +17,7 @@ SEC_USER_AGENT="earnings-radar your@email.com" node server.js
 - 财报日历：http://localhost:4173/calendar.html
 - A股排名：http://localhost:4173/ashare.html
 - A股日历：http://localhost:4173/ashare-calendar.html
+- 财务分析页会从排名/日历里的“财务分析”按钮进入，例如：http://localhost:4173/financials.html?market=cn&symbol=002384
 
 如果不设置 `SEC_USER_AGENT`，程序会使用默认值，但正式长期使用时建议换成自己的邮箱，方便符合 SEC EDGAR 的访问规范。
 
@@ -27,6 +28,7 @@ SEC_USER_AGENT="earnings-radar your@email.com" node server.js
 - 日历页点击“刷新日历”会重新拉取 Nasdaq 财报日历。
 - 日历页公司卡片会显示 Nasdaq 日历返回的市值，并在选中日期后按需加载公司主营业务简介；简介优先来自 Nasdaq company profile，失败时回退到 SEC submissions 的行业分类。公司名会尝试翻译成中文，翻译成功时显示在英文名下方；简介默认折叠，可点击展开/收起，旁边有“翻译”按钮，点击后按单家公司翻译成中文并缓存结果。市值超过 1000 亿美元的公司会在日历格子和当天公司卡片中高亮。
 - A股页面使用东方财富公开数据：排名取 `RPT_LICO_FN_CPD` 业绩表现结构化数据，经营现金流取 `RPT_DMSK_FN_CASHFLOW`，市值/行业取 `RPT_VALUEANALYSIS_DET`，日历按公告日聚合，个股简介取东方财富 F10 公司资料。A股列表会排除 ST / *ST 公司；A股日历中的市值以人民币计，超过 1000 亿元人民币的公司会高亮。
+- 财务分析页会展示历年营收、净利润、经营现金流、预收/合同负债、应收、存货和资产负债率等图表；A股来自东方财富三大财务报表，美股来自 SEC companyfacts 年度 XBRL。
 - 首次强制刷新可能需要几十秒到一两分钟，后续会命中本地 `.cache/` 缓存，通常是秒级。
 
 ## 首页筛选口径

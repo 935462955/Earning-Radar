@@ -1953,6 +1953,248 @@ async function getCompanyProfiles(symbols, force = false) {
   };
 }
 
+const FINANCIAL_METRICS = [
+  { key: "revenue", label: "营收", kind: "flow", unit: "money" },
+  { key: "netIncome", label: "净利润", kind: "flow", unit: "money" },
+  { key: "operatingCashFlow", label: "经营现金流", kind: "flow", unit: "money" },
+  { key: "operatingProfit", label: "经营利润", kind: "flow", unit: "money" },
+  { key: "contractLiabilities", label: "预收/合同负债", kind: "stock", unit: "money" },
+  { key: "accountsReceivable", label: "应收账款", kind: "stock", unit: "money" },
+  { key: "inventory", label: "存货", kind: "stock", unit: "money" },
+  { key: "totalAssets", label: "总资产", kind: "stock", unit: "money" },
+  { key: "totalLiabilities", label: "总负债", kind: "stock", unit: "money" },
+  { key: "debtAssetRatio", label: "资产负债率", kind: "ratio", unit: "percent" }
+];
+
+function finiteOrNull(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function yearFromReportDate(value) {
+  const date = ashareDate(value);
+  return date ? Number(date.slice(0, 4)) : null;
+}
+
+function pctFromEastmoney(value) {
+  const number = finiteOrNull(value);
+  return number == null ? null : number / 100;
+}
+
+function mergeFinancialRows(...rowSets) {
+  const byDate = new Map();
+  for (const rows of rowSets) {
+    for (const row of rows || []) {
+      const reportDate = ashareDate(row.REPORT_DATE || row.REPORTDATE);
+      if (!reportDate) continue;
+      byDate.set(reportDate, { ...(byDate.get(reportDate) || {}), ...row, reportDate });
+    }
+  }
+  return [...byDate.values()].sort((a, b) => String(a.reportDate).localeCompare(String(b.reportDate)));
+}
+
+function normalizeAshareFinancialPoint(row) {
+  return {
+    date: row.reportDate,
+    year: yearFromReportDate(row.reportDate),
+    reportType: row.DATE_TYPE_CODE || "",
+    revenue: finiteOrNull(row.TOTAL_OPERATE_INCOME),
+    netIncome: finiteOrNull(row.PARENT_NETPROFIT),
+    deductedNetIncome: finiteOrNull(row.DEDUCT_PARENT_NETPROFIT),
+    operatingProfit: finiteOrNull(row.OPERATE_PROFIT),
+    operatingCashFlow: finiteOrNull(row.NETCASH_OPERATE),
+    investingCashFlow: finiteOrNull(row.NETCASH_INVEST),
+    financingCashFlow: finiteOrNull(row.NETCASH_FINANCE),
+    capex: finiteOrNull(row.CONSTRUCT_LONG_ASSET),
+    totalAssets: finiteOrNull(row.TOTAL_ASSETS),
+    totalLiabilities: finiteOrNull(row.TOTAL_LIABILITIES),
+    totalEquity: finiteOrNull(row.TOTAL_EQUITY),
+    cash: finiteOrNull(row.MONETARYFUNDS),
+    accountsReceivable: finiteOrNull(row.ACCOUNTS_RECE),
+    inventory: finiteOrNull(row.INVENTORY),
+    accountsPayable: finiteOrNull(row.ACCOUNTS_PAYABLE),
+    contractLiabilities: finiteOrNull(row.ADVANCE_RECEIVABLES),
+    debtAssetRatio: pctFromEastmoney(row.DEBT_ASSET_RATIO),
+    currentRatio: pctFromEastmoney(row.CURRENT_RATIO)
+  };
+}
+
+async function fetchAshareFinancialStatementRows(reportName, code, force = false) {
+  return fetchEastmoneyPaged(
+    reportName,
+    {
+      pageSize: "100",
+      sortColumns: "REPORT_DATE",
+      sortTypes: "-1",
+      filter: `(SECURITY_CODE="${code}")`
+    },
+    force
+  );
+}
+
+async function getAshareFinancials(symbol, force = false) {
+  const code = String(symbol || "").replace(/\D/g, "").slice(0, 6);
+  if (!code) throw new Error("缺少 A股代码");
+  const cacheName = `ashare-financials-v1-${code}.json`;
+  if (!force) {
+    const cached = await readCache(cacheName, SEC_TTL);
+    if (cached) return { ...cached, cache: "hit" };
+  }
+
+  const [incomeRows, cashRows, balanceRows] = await Promise.all([
+    fetchAshareFinancialStatementRows("RPT_DMSK_FN_INCOME", code, force),
+    fetchAshareFinancialStatementRows("RPT_DMSK_FN_CASHFLOW", code, force),
+    fetchAshareFinancialStatementRows("RPT_DMSK_FN_BALANCE", code, force)
+  ]);
+  const merged = mergeFinancialRows(incomeRows, cashRows, balanceRows);
+  const points = merged.map(normalizeAshareFinancialPoint).filter((point) => point.year);
+  const annual = points.filter((point) => String(point.date).endsWith("-12-31"));
+  const quarterly = [...points].sort((a, b) => String(b.date).localeCompare(String(a.date))).slice(0, 12);
+  const sourceRow = incomeRows[0] || cashRows[0] || balanceRows[0] || {};
+  const payload = {
+    market: "cn",
+    symbol: code,
+    name: sourceRow.SECURITY_NAME_ABBR || code,
+    generatedAt: new Date().toISOString(),
+    source: "东方财富三大财务报表 RPT_DMSK_FN_INCOME/CASHFLOW/BALANCE",
+    currency: "CNY",
+    unitDivisor: 100000000,
+    unitLabel: "亿元",
+    metrics: FINANCIAL_METRICS,
+    annual: annual.length ? annual : points,
+    recent: quarterly
+  };
+  await writeCache(cacheName, payload);
+  return { ...payload, cache: "fresh" };
+}
+
+const US_FINANCIAL_CONCEPTS = {
+  revenue: [
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "Revenues",
+    "SalesRevenueNet"
+  ],
+  netIncome: ["NetIncomeLoss", "ProfitLoss"],
+  operatingProfit: ["OperatingIncomeLoss"],
+  operatingCashFlow: [
+    "NetCashProvidedByUsedInOperatingActivities",
+    "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"
+  ],
+  contractLiabilities: [
+    "ContractWithCustomerLiabilityCurrent",
+    "ContractWithCustomerLiability",
+    "DeferredRevenueCurrent",
+    "DeferredRevenue"
+  ],
+  totalAssets: ["Assets"],
+  totalLiabilities: ["Liabilities"],
+  totalEquity: ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+  cash: ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
+  accountsReceivable: ["AccountsReceivableNetCurrent", "AccountsReceivableNet"],
+  inventory: ["InventoryNet"]
+};
+
+function unitFactsForConcept(facts, concept, unit = "USD") {
+  return facts?.facts?.["us-gaap"]?.[concept]?.units?.[unit] || [];
+}
+
+function pickUsAnnualFacts(facts, concepts, unit = "USD") {
+  const yearly = new Map();
+  for (const concept of concepts) {
+    const rows = unitFactsForConcept(facts, concept, unit)
+      .filter((fact) => Number.isFinite(Number(fact.val)))
+      .filter((fact) => ["10-K", "20-F", "40-F"].includes(fact.form))
+      .filter((fact) => fact.fp === "FY" && fact.end)
+      .filter((fact) => {
+        const duration = daysBetween(fact.start, fact.end);
+        return !duration || duration >= 250;
+      })
+      .sort((a, b) => String(b.filed || "").localeCompare(String(a.filed || "")));
+    for (const fact of rows) {
+      const year = Number(String(fact.end).slice(0, 4));
+      const current = yearly.get(year);
+      if (!current || String(fact.filed || "").localeCompare(String(current.filed || "")) > 0) {
+        yearly.set(year, {
+          year,
+          date: fact.end,
+          value: Number(fact.val),
+          concept,
+          filed: fact.filed || ""
+        });
+      }
+    }
+  }
+  return yearly;
+}
+
+function normalizeUsFinancialPoint(year, maps) {
+  const value = (key) => maps[key]?.get(year)?.value ?? null;
+  const assets = value("totalAssets");
+  const liabilities = value("totalLiabilities");
+  return {
+    year,
+    date: maps.revenue?.get(year)?.date || maps.netIncome?.get(year)?.date || `${year}-12-31`,
+    revenue: value("revenue"),
+    netIncome: value("netIncome"),
+    operatingProfit: value("operatingProfit"),
+    operatingCashFlow: value("operatingCashFlow"),
+    contractLiabilities: value("contractLiabilities"),
+    totalAssets: assets,
+    totalLiabilities: liabilities,
+    totalEquity: value("totalEquity"),
+    cash: value("cash"),
+    accountsReceivable: value("accountsReceivable"),
+    inventory: value("inventory"),
+    debtAssetRatio: assets && liabilities ? liabilities / assets : null
+  };
+}
+
+async function getUsFinancials(symbol, force = false) {
+  const normalized = normalizeTicker(symbol || "");
+  if (!normalized) throw new Error("缺少美股代码");
+  const cacheName = `us-financials-v2-${normalized}.json`;
+  if (!force) {
+    const cached = await readCache(cacheName, SEC_TTL);
+    if (cached) return { ...cached, cache: "hit" };
+  }
+  const tickerMap = await loadTickerMap(force);
+  const company = tickerMap.get(normalized);
+  if (!company?.cik) throw new Error(`未找到 ${normalized} 的 CIK`);
+  const factsUrl = `https://data.sec.gov/api/xbrl/companyfacts/CIK${cikPad(company.cik)}.json`;
+  const facts = await cachedSecJson(factsUrl, force, SEC_TTL);
+  const maps = Object.fromEntries(
+    Object.entries(US_FINANCIAL_CONCEPTS).map(([key, concepts]) => [
+      key,
+      pickUsAnnualFacts(facts, concepts)
+    ])
+  );
+  const years = [
+    ...new Set(
+      Object.values(maps).flatMap((map) => [...map.keys()])
+    )
+  ].sort((a, b) => a - b);
+  const annual = years.map((year) => normalizeUsFinancialPoint(year, maps));
+  const payload = {
+    market: "us",
+    symbol: normalized,
+    name: company.name || facts.entityName || normalized,
+    generatedAt: new Date().toISOString(),
+    source: "SEC companyfacts 年度 10-K/20-F/40-F XBRL",
+    currency: "USD",
+    unitDivisor: 1000000000,
+    unitLabel: "十亿美元",
+    metrics: FINANCIAL_METRICS,
+    annual,
+    recent: annual.slice(-8).reverse()
+  };
+  await writeCache(cacheName, payload);
+  return { ...payload, cache: "fresh" };
+}
+
+async function getFinancials(market, symbol, force = false) {
+  return market === "cn" ? getAshareFinancials(symbol, force) : getUsFinancials(symbol, force);
+}
+
 async function getChineseTranslation(text, force = false) {
   const translation = await translateToChinese(text, force);
   return {
@@ -2859,6 +3101,7 @@ async function serveStatic(req, res, pathname) {
   if (filePath === "/calendar") filePath = "/calendar.html";
   if (filePath === "/ashare") filePath = "/ashare.html";
   if (filePath === "/ashare-calendar") filePath = "/ashare-calendar.html";
+  if (filePath === "/financials") filePath = "/financials.html";
   const resolved = path.normalize(path.join(PUBLIC_DIR, filePath));
   if (!resolved.startsWith(PUBLIC_DIR)) {
     sendJson(res, 403, { error: "Forbidden" });
@@ -2919,6 +3162,13 @@ async function route(req, res) {
       const force = requestUrl.searchParams.get("force") === "1";
       const text = requestUrl.searchParams.get("text") || "";
       sendJson(res, 200, await getChineseTranslation(text, force));
+      return;
+    }
+    if (requestUrl.pathname === "/api/financials") {
+      const force = requestUrl.searchParams.get("force") === "1";
+      const market = requestUrl.searchParams.get("market") === "cn" ? "cn" : "us";
+      const symbol = requestUrl.searchParams.get("symbol") || "";
+      sendJson(res, 200, await getFinancials(market, symbol, force));
       return;
     }
     if (requestUrl.pathname === "/api/status") {
