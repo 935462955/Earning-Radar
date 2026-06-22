@@ -1976,6 +1976,20 @@ function yearFromReportDate(value) {
   return date ? Number(date.slice(0, 4)) : null;
 }
 
+function quarterFromReportDate(value) {
+  const date = ashareDate(value);
+  const month = Number(date.slice(5, 7));
+  if (month === 3) return 1;
+  if (month === 6) return 2;
+  if (month === 9) return 3;
+  if (month === 12) return 4;
+  return null;
+}
+
+function fiscalPeriodLabel(year, quarter) {
+  return year && quarter ? `${year}Q${quarter}` : String(year || "");
+}
+
 function pctFromEastmoney(value) {
   const number = finiteOrNull(value);
   return number == null ? null : number / 100;
@@ -1994,9 +2008,13 @@ function mergeFinancialRows(...rowSets) {
 }
 
 function normalizeAshareFinancialPoint(row) {
+  const year = yearFromReportDate(row.reportDate);
+  const quarter = quarterFromReportDate(row.reportDate);
   return {
     date: row.reportDate,
-    year: yearFromReportDate(row.reportDate),
+    year,
+    quarter,
+    periodLabel: fiscalPeriodLabel(year, quarter),
     reportType: row.DATE_TYPE_CODE || "",
     revenue: finiteOrNull(row.TOTAL_OPERATE_INCOME),
     netIncome: finiteOrNull(row.PARENT_NETPROFIT),
@@ -2019,6 +2037,40 @@ function normalizeAshareFinancialPoint(row) {
   };
 }
 
+const ASHARE_CUMULATIVE_FLOW_KEYS = [
+  "revenue",
+  "netIncome",
+  "deductedNetIncome",
+  "operatingProfit",
+  "operatingCashFlow",
+  "investingCashFlow",
+  "financingCashFlow",
+  "capex"
+];
+
+function deriveAshareSingleQuarterPoints(points) {
+  const sorted = [...points].filter((point) => point.year && point.quarter).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const byPeriod = new Map(sorted.map((point) => [`${point.year}Q${point.quarter}`, point]));
+  return sorted.map((point) => {
+    const output = {
+      ...point,
+      sourcePeriodType: "single-quarter",
+      derivation: point.quarter === 1 ? "Q1 uses disclosed period amount" : "single-quarter amount = current cumulative amount - prior cumulative amount"
+    };
+    for (const key of ASHARE_CUMULATIVE_FLOW_KEYS) {
+      const current = finiteOrNull(point[key]);
+      if (point.quarter === 1) {
+        output[key] = current;
+        continue;
+      }
+      const previous = byPeriod.get(`${point.year}Q${point.quarter - 1}`);
+      const prior = finiteOrNull(previous?.[key]);
+      output[key] = current != null && prior != null ? current - prior : null;
+    }
+    return output;
+  });
+}
+
 async function fetchAshareFinancialStatementRows(reportName, code, force = false) {
   return fetchEastmoneyPaged(
     reportName,
@@ -2035,7 +2087,7 @@ async function fetchAshareFinancialStatementRows(reportName, code, force = false
 async function getAshareFinancials(symbol, force = false) {
   const code = String(symbol || "").replace(/\D/g, "").slice(0, 6);
   if (!code) throw new Error("缺少 A股代码");
-  const cacheName = `ashare-financials-v1-${code}.json`;
+  const cacheName = `ashare-financials-v2-${code}.json`;
   if (!force) {
     const cached = await readCache(cacheName, SEC_TTL);
     if (cached) return { ...cached, cache: "hit" };
@@ -2048,8 +2100,8 @@ async function getAshareFinancials(symbol, force = false) {
   ]);
   const merged = mergeFinancialRows(incomeRows, cashRows, balanceRows);
   const points = merged.map(normalizeAshareFinancialPoint).filter((point) => point.year);
+  const quarterly = deriveAshareSingleQuarterPoints(points);
   const annual = points.filter((point) => String(point.date).endsWith("-12-31"));
-  const quarterly = [...points].sort((a, b) => String(b.date).localeCompare(String(a.date))).slice(0, 12);
   const sourceRow = incomeRows[0] || cashRows[0] || balanceRows[0] || {};
   const payload = {
     market: "cn",
@@ -2061,8 +2113,13 @@ async function getAshareFinancials(symbol, force = false) {
     unitDivisor: 100000000,
     unitLabel: "亿元",
     metrics: FINANCIAL_METRICS,
+    accuracyNotes: [
+      "A股利润表和现金流量表的季报原始值通常是年初至报告期末累计口径；页面展示的季度流量按同一年相邻报告期差额拆分，缺上一期时不强行估算。",
+      "资产负债表项目是报告期末时点余额，直接使用披露值；资产负债率直接使用东方财富结构化字段。"
+    ],
     annual: annual.length ? annual : points,
-    recent: quarterly
+    quarterly,
+    recent: quarterly.slice(-16).reverse()
   };
   await writeCache(cacheName, payload);
   return { ...payload, cache: "fresh" };
@@ -2127,6 +2184,40 @@ function pickUsAnnualFacts(facts, concepts, unit = "USD") {
   return yearly;
 }
 
+function pickUsQuarterlyFacts(facts, concepts, options = {}) {
+  const unit = options.unit || "USD";
+  const instant = options.instant === true;
+  const quarterly = new Map();
+  const framePattern = instant ? /^CY(\d{4})Q([1-4])I$/ : /^CY(\d{4})Q([1-4])$/;
+  for (const concept of concepts) {
+    const rows = unitFactsForConcept(facts, concept, unit)
+      .filter((fact) => Number.isFinite(Number(fact.val)))
+      .filter((fact) => ["10-Q", "10-K", "20-F", "40-F"].includes(fact.form))
+      .filter((fact) => framePattern.test(fact.frame || ""))
+      .sort((a, b) => String(b.filed || "").localeCompare(String(a.filed || "")));
+    for (const fact of rows) {
+      const match = framePattern.exec(fact.frame || "");
+      if (!match) continue;
+      const year = Number(match[1]);
+      const quarter = Number(match[2]);
+      const key = `${year}Q${quarter}`;
+      const current = quarterly.get(key);
+      if (!current || String(fact.filed || "").localeCompare(String(current.filed || "")) > 0) {
+        quarterly.set(key, {
+          year,
+          quarter,
+          periodLabel: key,
+          date: fact.end || `${year}-12-31`,
+          value: Number(fact.val),
+          concept,
+          filed: fact.filed || ""
+        });
+      }
+    }
+  }
+  return quarterly;
+}
+
 function normalizeUsFinancialPoint(year, maps) {
   const value = (key) => maps[key]?.get(year)?.value ?? null;
   const assets = value("totalAssets");
@@ -2149,10 +2240,41 @@ function normalizeUsFinancialPoint(year, maps) {
   };
 }
 
+function normalizeUsQuarterlyPoint(periodKey, maps) {
+  const value = (key) => maps[key]?.get(periodKey)?.value ?? null;
+  const revenuePoint = maps.revenue?.get(periodKey);
+  const netIncomePoint = maps.netIncome?.get(periodKey);
+  const source = revenuePoint || netIncomePoint || maps.totalAssets?.get(periodKey) || {};
+  const year = source.year || Number(periodKey.slice(0, 4));
+  const quarter = source.quarter || Number(periodKey.slice(-1));
+  const assets = value("totalAssets");
+  const liabilities = value("totalLiabilities");
+  return {
+    year,
+    quarter,
+    periodLabel: fiscalPeriodLabel(year, quarter),
+    date: source.date || "",
+    revenue: value("revenue"),
+    netIncome: value("netIncome"),
+    operatingProfit: value("operatingProfit"),
+    operatingCashFlow: value("operatingCashFlow"),
+    contractLiabilities: value("contractLiabilities"),
+    totalAssets: assets,
+    totalLiabilities: liabilities,
+    totalEquity: value("totalEquity"),
+    cash: value("cash"),
+    accountsReceivable: value("accountsReceivable"),
+    inventory: value("inventory"),
+    debtAssetRatio: assets && liabilities ? liabilities / assets : null,
+    sourcePeriodType: "reported-quarter-frame",
+    derivation: "SEC companyfacts explicit quarterly frame"
+  };
+}
+
 async function getUsFinancials(symbol, force = false) {
   const normalized = normalizeTicker(symbol || "");
   if (!normalized) throw new Error("缺少美股代码");
-  const cacheName = `us-financials-v2-${normalized}.json`;
+  const cacheName = `us-financials-v3-${normalized}.json`;
   if (!force) {
     const cached = await readCache(cacheName, SEC_TTL);
     if (cached) return { ...cached, cache: "hit" };
@@ -2168,24 +2290,46 @@ async function getUsFinancials(symbol, force = false) {
       pickUsAnnualFacts(facts, concepts)
     ])
   );
+  const quarterlyMaps = Object.fromEntries(
+    Object.entries(US_FINANCIAL_CONCEPTS).map(([key, concepts]) => [
+      key,
+      pickUsQuarterlyFacts(facts, concepts, {
+        instant: ["contractLiabilities", "totalAssets", "totalLiabilities", "totalEquity", "cash", "accountsReceivable", "inventory"].includes(key)
+      })
+    ])
+  );
   const years = [
     ...new Set(
       Object.values(maps).flatMap((map) => [...map.keys()])
     )
   ].sort((a, b) => a - b);
   const annual = years.map((year) => normalizeUsFinancialPoint(year, maps));
+  const quarterKeys = [
+    ...new Set(Object.values(quarterlyMaps).flatMap((map) => [...map.keys()]))
+  ].sort((a, b) => {
+    const ay = Number(a.slice(0, 4));
+    const by = Number(b.slice(0, 4));
+    if (ay !== by) return ay - by;
+    return Number(a.slice(-1)) - Number(b.slice(-1));
+  });
+  const quarterly = quarterKeys.map((key) => normalizeUsQuarterlyPoint(key, quarterlyMaps));
   const payload = {
     market: "us",
     symbol: normalized,
     name: company.name || facts.entityName || normalized,
     generatedAt: new Date().toISOString(),
-    source: "SEC companyfacts 年度 10-K/20-F/40-F XBRL",
+    source: "SEC companyfacts XBRL 年度事实与明确季度 frame",
     currency: "USD",
     unitDivisor: 1000000000,
     unitLabel: "十亿美元",
     metrics: FINANCIAL_METRICS,
+    accuracyNotes: [
+      "美股季度数据优先使用 SEC companyfacts 中带明确季度 frame 的 XBRL 事实；缺少明确季度 frame 的指标不会被猜算。",
+      "年度数据来自 10-K/20-F/40-F 年度事实，季度图表和年度表分开保留口径。"
+    ],
     annual,
-    recent: annual.slice(-8).reverse()
+    quarterly,
+    recent: (quarterly.length ? quarterly : annual).slice(-16).reverse()
   };
   await writeCache(cacheName, payload);
   return { ...payload, cache: "fresh" };

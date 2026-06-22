@@ -4,7 +4,7 @@
 
 ## 启动
 
-项目没有外部依赖，直接用 Node.js 启动即可。建议使用 Node.js 20 或更高版本。
+项目建议使用 Node.js 20 或更高版本。ECharts 已作为前端图表库加入并随 `public/vendor/echarts.min.js` 本地提供；如需重新安装依赖，可执行 `pnpm install`。
 
 ```bash
 cd /Users/bytedance/Documents/Codex/2026-06-17/new-chat
@@ -28,7 +28,8 @@ SEC_USER_AGENT="earnings-radar your@email.com" node server.js
 - 日历页点击“刷新日历”会重新拉取 Nasdaq 财报日历。
 - 日历页公司卡片会显示 Nasdaq 日历返回的市值，并在选中日期后按需加载公司主营业务简介；简介优先来自 Nasdaq company profile，失败时回退到 SEC submissions 的行业分类。公司名会尝试翻译成中文，翻译成功时显示在英文名下方；简介默认折叠，可点击展开/收起，旁边有“翻译”按钮，点击后按单家公司翻译成中文并缓存结果。市值超过 1000 亿美元的公司会在日历格子和当天公司卡片中高亮。
 - A股页面使用东方财富公开数据：排名取 `RPT_LICO_FN_CPD` 业绩表现结构化数据，经营现金流取 `RPT_DMSK_FN_CASHFLOW`，市值/行业取 `RPT_VALUEANALYSIS_DET`，日历按公告日聚合，个股简介取东方财富 F10 公司资料。A股列表会排除 ST / *ST 公司；A股日历中的市值以人民币计，超过 1000 亿元人民币的公司会高亮。
-- 财务分析页会展示历年营收、净利润、经营现金流、预收/合同负债、应收、存货和资产负债率等图表；A股来自东方财富三大财务报表，美股来自 SEC companyfacts 年度 XBRL。
+- 财务分析页会展示营收、净利润、经营现金流、预收/合同负债、应收、存货和资产负债率等图表；A股来自东方财富三大财务报表，美股来自 SEC companyfacts XBRL。
+- 财务分析页默认按季度展示横坐标。A股利润表/现金流量表原始季报多为年初至报告期末累计口径，页面按同一年相邻报告期差额拆成单季值；资产负债表项目使用报告期末余额。美股季度图表只使用 SEC companyfacts 中带明确季度 frame 的 XBRL 事实，缺失项不强行估算。
 - 首次强制刷新可能需要几十秒到一两分钟，后续会命中本地 `.cache/` 缓存，通常是秒级。
 
 ## 首页筛选口径

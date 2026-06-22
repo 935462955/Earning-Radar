@@ -10,7 +10,8 @@ const state = {
   profileRequests: new Set(),
   businessTranslations: {},
   translationRequests: new Set(),
-  expandedBusinessDescriptions: new Set()
+  expandedBusinessDescriptions: new Set(),
+  financialCharts: []
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -924,9 +925,14 @@ function formatFinancialValue(value, payload, unit = "money") {
 }
 
 function yoyValue(points, index, key) {
-  if (index <= 0) return null;
   const current = financialValue(points[index], key);
-  const prior = financialValue(points[index - 1], key);
+  const currentPoint = points[index] || {};
+  const priorIndex =
+    currentPoint.quarter != null
+      ? points.findIndex((point) => point.year === currentPoint.year - 1 && point.quarter === currentPoint.quarter)
+      : index - 1;
+  if (priorIndex < 0) return null;
+  const prior = financialValue(points[priorIndex], key);
   if (current == null || prior == null || Math.abs(prior) < 1) return null;
   return (current - prior) / Math.abs(prior);
 }
@@ -936,7 +942,7 @@ function chartColor(index) {
 }
 
 function renderFinancialCards(payload) {
-  const points = payload.annual || [];
+  const points = financialDisplayPoints(payload);
   const latest = points[points.length - 1] || {};
   const metricMap = financialMetricMap(payload);
   const cards = ["revenue", "netIncome", "operatingCashFlow", "debtAssetRatio"].map((key) => {
@@ -953,125 +959,167 @@ function renderFinancialCards(payload) {
   $("#financial-summary").innerHTML = cards.join("");
 }
 
-function chartLegend(keys, metricMap) {
-  return `<div class="chart-legend">${keys
-    .map(
-      (key, index) =>
-        `<span><i style="background:${chartColor(index)}"></i>${escapeHtml(metricMap[key]?.label || key)}</span>`
-    )
-    .join("")}</div>`;
+function pointLabel(point) {
+  return point.periodLabel || (point.quarter ? `${point.year}Q${point.quarter}` : String(point.year || point.date || ""));
 }
 
-function renderBarChart(title, payload, points, keys) {
-  const metricMap = financialMetricMap(payload);
-  const width = 760;
-  const height = 260;
-  const left = 48;
-  const right = 18;
-  const top = 18;
-  const bottom = 38;
-  const chartWidth = width - left - right;
-  const chartHeight = height - top - bottom;
-  const values = points.flatMap((point) => keys.map((key) => Math.max(0, financialValue(point, key) || 0)));
-  const max = Math.max(...values, 1);
-  const groupWidth = chartWidth / Math.max(points.length, 1);
-  const barWidth = Math.max(4, Math.min(24, (groupWidth * 0.72) / keys.length));
-  const bars = points
-    .flatMap((point, pointIndex) =>
-      keys.map((key, keyIndex) => {
-        const raw = Math.max(0, financialValue(point, key) || 0);
-        const scaled = raw / max;
-        const x = left + pointIndex * groupWidth + (groupWidth - barWidth * keys.length) / 2 + keyIndex * barWidth;
-        const h = scaled * chartHeight;
-        const y = top + chartHeight - h;
-        return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(2, barWidth - 2).toFixed(
-          1
-        )}" height="${h.toFixed(1)}" rx="3" fill="${chartColor(keyIndex)}">
-          <title>${point.year} ${metricMap[key]?.label || key}: ${formatFinancialValue(raw, payload, metricMap[key]?.unit)}</title>
-        </rect>`;
+function financialDisplayPoints(payload) {
+  const points = (payload.quarterly?.length ? payload.quarterly : payload.annual || [])
+    .filter((point) => point.year)
+    .sort((a, b) => {
+      if (a.year !== b.year) return a.year - b.year;
+      return (a.quarter || 0) - (b.quarter || 0);
+    });
+  return points.slice(-20);
+}
+
+function disposeFinancialCharts() {
+  state.financialCharts.forEach((chart) => chart.dispose());
+  state.financialCharts = [];
+}
+
+function rawFinancialValue(value, currency) {
+  if (value == null || Number.isNaN(Number(value))) return "--";
+  return `${currency || ""}${Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 2 })}`;
+}
+
+function financialTooltipFormatter(payload, metricMap) {
+  return (items) => {
+    const list = Array.isArray(items) ? items : [items];
+    const axis = list[0]?.axisValueLabel || "";
+    const rows = list
+      .map((item) => {
+        const key = item.seriesId || item.seriesName;
+        const metric = metricMap[key] || { unit: "money" };
+        const value = Array.isArray(item.value) ? item.value[1] : item.value;
+        return `<div class="tooltip-row">
+          <span>${item.marker}${escapeHtml(item.seriesName)}</span>
+          <strong>${escapeHtml(formatFinancialValue(value, payload, metric.unit))}</strong>
+          <em>${escapeHtml(rawFinancialValue(value, metric.unit === "percent" ? "" : payload.currency))}</em>
+        </div>`;
       })
-    )
-    .join("");
-  const labels = points
-    .map((point, index) => {
-      const x = left + index * groupWidth + groupWidth / 2;
-      return `<text x="${x.toFixed(1)}" y="${height - 12}" text-anchor="middle">${point.year}</text>`;
-    })
-    .join("");
+      .join("");
+    return `<div class="financial-tooltip"><strong>${escapeHtml(axis)}</strong>${rows}</div>`;
+  };
+}
+
+function moneyAxisFormatter(payload) {
+  return (value) => formatFinancialValue(value, payload, "money");
+}
+
+function percentAxisFormatter(value) {
+  return pct(Number(value));
+}
+
+function financialSeries(payload, points, key, options = {}) {
+  const metricMap = financialMetricMap(payload);
+  const metric = metricMap[key] || { label: key, unit: "money" };
+  return {
+    id: key,
+    name: metric.label,
+    type: options.type || "bar",
+    yAxisIndex: options.yAxisIndex || 0,
+    data: points.map((point) => financialValue(point, key)),
+    smooth: options.smooth !== false,
+    connectNulls: false,
+    barMaxWidth: 26,
+    symbolSize: 7,
+    lineStyle: { width: 3 },
+    itemStyle: options.color ? { color: options.color } : undefined,
+    emphasis: { focus: "series" }
+  };
+}
+
+function baseFinancialChartOption(title, payload, points, yAxes, series) {
+  const metricMap = financialMetricMap(payload);
+  return {
+    color: series.map((item, index) => item.itemStyle?.color || chartColor(index)),
+    title: { text: title, left: 0, top: 0, textStyle: { fontSize: 16, fontWeight: 800, color: "#101828" } },
+    tooltip: {
+      trigger: "axis",
+      axisPointer: { type: "cross" },
+      appendToBody: true,
+      formatter: financialTooltipFormatter(payload, metricMap)
+    },
+    legend: { top: 2, right: 0, type: "scroll" },
+    grid: { left: 62, right: yAxes.length > 1 ? 72 : 28, top: 54, bottom: 64, containLabel: true },
+    dataZoom: [
+      { type: "inside", start: Math.max(0, 100 - (12 / Math.max(points.length, 1)) * 100), end: 100 },
+      { type: "slider", height: 22, bottom: 12, start: Math.max(0, 100 - (12 / Math.max(points.length, 1)) * 100), end: 100 }
+    ],
+    xAxis: {
+      type: "category",
+      data: points.map(pointLabel),
+      axisLabel: { rotate: points.length > 10 ? 35 : 0, color: "#344054", fontWeight: 700 }
+    },
+    yAxis: yAxes,
+    series
+  };
+}
+
+function chartContainer(title, id) {
   return `<section class="chart-card">
-    <div class="chart-heading"><h2>${escapeHtml(title)}</h2>${chartLegend(keys, metricMap)}</div>
-    <svg class="financial-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}">
-      <line x1="${left}" y1="${top + chartHeight}" x2="${width - right}" y2="${top + chartHeight}" />
-      <text x="${left}" y="12">${escapeHtml(formatFinancialValue(max, payload, "money"))}</text>
-      ${bars}
-      <g class="chart-axis">${labels}</g>
-    </svg>
+    <div class="chart-container" id="${escapeHtml(id)}" role="img" aria-label="${escapeHtml(title)}"></div>
   </section>`;
 }
 
-function renderLineChart(title, payload, points, keys) {
-  const metricMap = financialMetricMap(payload);
-  const width = 760;
-  const height = 260;
-  const left = 48;
-  const right = 18;
-  const top = 18;
-  const bottom = 38;
-  const chartWidth = width - left - right;
-  const chartHeight = height - top - bottom;
-  const values = points.flatMap((point) => keys.map((key) => financialValue(point, key))).filter((value) => value != null);
-  if (!values.length) {
-    return `<section class="chart-card"><div class="chart-heading"><h2>${escapeHtml(title)}</h2></div><div class="empty-cell">暂无可绘制数据。</div></section>`;
+function renderFinancialCharts(payload, points) {
+  disposeFinancialCharts();
+  const chartDefs = [
+    {
+      id: "financial-chart-income",
+      title: "营收与利润（季度）",
+      yAxes: [
+        { type: "value", name: payload.unitLabel, axisLabel: { formatter: moneyAxisFormatter(payload) }, splitLine: { lineStyle: { color: "#edf1f7" } } },
+        { type: "value", name: `利润/${payload.unitLabel}`, axisLabel: { formatter: moneyAxisFormatter(payload) }, splitLine: { show: false } }
+      ],
+      series: [
+        financialSeries(payload, points, "revenue", { type: "bar", color: "#2563eb" }),
+        financialSeries(payload, points, "netIncome", { type: "line", yAxisIndex: 1, color: "#0f9f6e" }),
+        financialSeries(payload, points, "operatingProfit", { type: "line", yAxisIndex: 1, color: "#c98500" })
+      ]
+    },
+    {
+      id: "financial-chart-cash",
+      title: "现金流与预收/合同负债（季度）",
+      yAxes: [
+        { type: "value", name: payload.unitLabel, axisLabel: { formatter: moneyAxisFormatter(payload) }, splitLine: { lineStyle: { color: "#edf1f7" } } },
+        { type: "value", name: `余额/${payload.unitLabel}`, axisLabel: { formatter: moneyAxisFormatter(payload) }, splitLine: { show: false } }
+      ],
+      series: [
+        financialSeries(payload, points, "operatingCashFlow", { type: "bar", color: "#0891b2" }),
+        financialSeries(payload, points, "contractLiabilities", { type: "line", yAxisIndex: 1, color: "#7c3aed" })
+      ]
+    },
+    {
+      id: "financial-chart-quality",
+      title: "资产质量（季度末）",
+      yAxes: [{ type: "value", name: payload.unitLabel, axisLabel: { formatter: moneyAxisFormatter(payload) }, splitLine: { lineStyle: { color: "#edf1f7" } } }],
+      series: [
+        financialSeries(payload, points, "accountsReceivable", { type: "bar", color: "#ef4444" }),
+        financialSeries(payload, points, "inventory", { type: "bar", color: "#f59e0b" }),
+        financialSeries(payload, points, "contractLiabilities", { type: "line", color: "#7c3aed" })
+      ]
+    },
+    {
+      id: "financial-chart-debt",
+      title: "资产负债率（季度末）",
+      yAxes: [{ type: "value", name: "比例", axisLabel: { formatter: percentAxisFormatter }, splitLine: { lineStyle: { color: "#edf1f7" } } }],
+      series: [financialSeries(payload, points, "debtAssetRatio", { type: "line", color: "#475467" })]
+    }
+  ];
+  $("#financial-charts").innerHTML = chartDefs.map((chart) => chartContainer(chart.title, chart.id)).join("");
+  if (!window.echarts) {
+    $("#financial-charts").innerHTML = '<div class="empty-cell">ECharts 加载失败，无法绘制图表。</div>';
+    return;
   }
-  let min = Math.min(...values);
-  let max = Math.max(...values);
-  if (min > 0) min = 0;
-  if (max === min) max += 1;
-  const yFor = (value) => top + (1 - (value - min) / (max - min)) * chartHeight;
-  const xFor = (index) => left + (points.length <= 1 ? chartWidth / 2 : (index / (points.length - 1)) * chartWidth);
-  const lines = keys
-    .map((key, keyIndex) => {
-      const coordinates = points
-        .map((point, index) => {
-          const value = financialValue(point, key);
-          if (value == null) return null;
-          return `${xFor(index).toFixed(1)},${yFor(value).toFixed(1)}`;
-        })
-        .filter(Boolean);
-      if (coordinates.length < 2) return "";
-      return `<polyline points="${coordinates.join(" ")}" fill="none" stroke="${chartColor(keyIndex)}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />`;
-    })
-    .join("");
-  const dots = keys
-    .flatMap((key, keyIndex) =>
-      points.map((point, index) => {
-        const value = financialValue(point, key);
-        if (value == null) return "";
-        return `<circle cx="${xFor(index).toFixed(1)}" cy="${yFor(value).toFixed(1)}" r="3.5" fill="${chartColor(
-          keyIndex
-        )}"><title>${point.year} ${metricMap[key]?.label || key}: ${formatFinancialValue(
-          value,
-          payload,
-          metricMap[key]?.unit
-        )}</title></circle>`;
-      })
-    )
-    .join("");
-  const labels = points
-    .map((point, index) => `<text x="${xFor(index).toFixed(1)}" y="${height - 12}" text-anchor="middle">${point.year}</text>`)
-    .join("");
-  return `<section class="chart-card">
-    <div class="chart-heading"><h2>${escapeHtml(title)}</h2>${chartLegend(keys, metricMap)}</div>
-    <svg class="financial-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}">
-      <line x1="${left}" y1="${top + chartHeight}" x2="${width - right}" y2="${top + chartHeight}" />
-      <line x1="${left}" y1="${top}" x2="${left}" y2="${top + chartHeight}" />
-      <text x="${left}" y="12">${escapeHtml(formatFinancialValue(max, payload, metricMap[keys[0]]?.unit))}</text>
-      <text x="${left}" y="${top + chartHeight - 4}">${escapeHtml(formatFinancialValue(min, payload, metricMap[keys[0]]?.unit))}</text>
-      ${lines}
-      ${dots}
-      <g class="chart-axis">${labels}</g>
-    </svg>
-  </section>`;
+  chartDefs.forEach((definition) => {
+    const element = document.getElementById(definition.id);
+    if (!element) return;
+    const chart = window.echarts.init(element, null, { renderer: "canvas" });
+    chart.setOption(baseFinancialChartOption(definition.title, payload, points, definition.yAxes, definition.series));
+    state.financialCharts.push(chart);
+  });
 }
 
 function renderFinancialTable(payload, points) {
@@ -1081,14 +1129,14 @@ function renderFinancialTable(payload, points) {
     <div class="table-scroll">
       <table class="ranking-table">
         <thead>
-          <tr><th>年份</th>${columns.map((key) => `<th>${escapeHtml(metricMap[key]?.label || key)}</th>`).join("")}</tr>
+          <tr><th>报告期</th>${columns.map((key) => `<th>${escapeHtml(metricMap[key]?.label || key)}</th>`).join("")}</tr>
         </thead>
         <tbody>
           ${[...points]
             .reverse()
             .map(
               (point) =>
-                `<tr><td>${escapeHtml(point.year)}</td>${columns
+                `<tr><td>${escapeHtml(pointLabel(point))}<div class="muted">${escapeHtml(point.date || "")}</div></td>${columns
                   .map((key) => `<td>${formatFinancialValue(financialValue(point, key), payload, metricMap[key]?.unit)}</td>`)
                   .join("")}</tr>`
             )
@@ -1099,25 +1147,43 @@ function renderFinancialTable(payload, points) {
   </section>`;
 }
 
+function renderFinancialMethod(payload) {
+  const notes = payload.accuracyNotes || [];
+  $("#financial-method").innerHTML = `<div class="criteria-grid">
+    <div>
+      <span>横坐标口径</span>
+      <strong>季度报告期</strong>
+      <p>${payload.quarterly?.length ? "优先展示季度序列，最近 20 个报告期可通过底部滑块缩放。" : "当前公司缺少季度序列，回退到年度序列。"}</p>
+    </div>
+    <div>
+      <span>数据来源</span>
+      <strong>${escapeHtml(payload.market === "cn" ? "东方财富结构化报表" : "SEC companyfacts")}</strong>
+      <p>${escapeHtml(payload.source || "")}</p>
+    </div>
+    <div>
+      <span>准确性说明</span>
+      <strong>不做缺失值猜算</strong>
+      <p>${escapeHtml(notes.join(" ") || "缺失或无法明确归属季度的数据不会被强行估算。")}</p>
+    </div>
+  </div>`;
+}
+
 function renderFinancials(payload) {
-  const points = (payload.annual || []).filter((point) => point.year).slice(-8);
+  const points = financialDisplayPoints(payload);
   const name = payload.name || financialPageParams().name || payload.symbol;
   $("#financial-title").textContent = `${payload.symbol} ${name}`;
   $("#financial-subtitle").textContent = `${payload.market === "cn" ? "A股" : "美股"} | ${payload.source} | 更新 ${formatDateTime(
     payload.generatedAt
   )}`;
   renderFinancialCards(payload);
+  renderFinancialMethod(payload);
   if (!points.length) {
+    disposeFinancialCharts();
     $("#financial-charts").innerHTML = '<div class="empty-cell">暂无历史财务数据。</div>';
     $("#financial-table").innerHTML = "";
     return;
   }
-  $("#financial-charts").innerHTML = [
-    renderBarChart("营收与利润", payload, points, ["revenue", "netIncome", "operatingProfit"]),
-    renderLineChart("现金流与预收/合同负债", payload, points, ["operatingCashFlow", "contractLiabilities"]),
-    renderBarChart("资产质量", payload, points, ["accountsReceivable", "inventory", "contractLiabilities"]),
-    renderLineChart("资产负债率", payload, points, ["debtAssetRatio"])
-  ].join("");
+  renderFinancialCharts(payload, points);
   $("#financial-table").innerHTML = renderFinancialTable(payload, points);
 }
 
@@ -1134,7 +1200,7 @@ async function loadFinancials(force = false) {
       `/api/financials?market=${encodeURIComponent(params.market)}&symbol=${encodeURIComponent(params.symbol)}${force ? "&force=1" : ""}`
     );
     renderFinancials(payload);
-    setStatus("#financial-status", `完成：读取 ${payload.annual?.length || 0} 年数据。`, "ok");
+    setStatus("#financial-status", `完成：读取 ${financialDisplayPoints(payload).length} 个报告期。`, "ok");
   } catch (error) {
     setStatus("#financial-status", `读取失败：${error.message}`, "error");
   } finally {
@@ -1153,6 +1219,9 @@ function initFinancials() {
     return;
   }
   $("#refresh-financials")?.addEventListener("click", () => loadFinancials(true));
+  window.addEventListener("resize", () => {
+    state.financialCharts.forEach((chart) => chart.resize());
+  });
   loadFinancials(false);
 }
 

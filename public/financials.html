@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>财务报表分析</title>
     <link rel="stylesheet" href="/styles.css" />
+    <script src="/vendor/echarts.min.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
   <body data-page="financials" data-market="us">
@@ -43,6 +44,7 @@
       </section>
 
       <section class="status-line" id="financial-status" role="status"></section>
+      <section class="financial-method" id="financial-method" aria-label="数据口径"></section>
       <section class="financial-charts" id="financial-charts" aria-label="财务图表"></section>
       <div id="financial-table"></div>
     </main>

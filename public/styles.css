@@ -963,9 +963,12 @@ button.calendar-cell {
   margin: 14px 0;
 }
 
+.financial-method {
+  margin: 8px 0 14px;
+}
+
 .chart-card {
   min-width: 0;
-  overflow-x: auto;
   padding: 14px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1028,6 +1031,51 @@ button.calendar-cell {
 
 .chart-axis text {
   fill: var(--slate);
+}
+
+.chart-container {
+  width: 100%;
+  min-height: 380px;
+}
+
+.financial-tooltip {
+  display: grid;
+  gap: 8px;
+  min-width: 260px;
+}
+
+.financial-tooltip > strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.tooltip-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px 12px;
+  align-items: baseline;
+  color: var(--slate);
+  font-size: 12px;
+}
+
+.tooltip-row span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tooltip-row strong {
+  color: var(--text);
+  font-size: 12px;
+  text-align: right;
+}
+
+.tooltip-row em {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
 }
 
 .financial-table-panel {
