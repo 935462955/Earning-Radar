@@ -4,9 +4,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>财务报表分析</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=20260630b" />
     <script src="/vendor/echarts.min.js" defer></script>
-    <script src="/app.js" defer></script>
+    <script src="/app.js?v=20260630b" defer></script>
   </head>
   <body data-page="financials" data-market="us">
     <header class="topbar">
@@ -29,6 +29,9 @@
           <p id="financial-subtitle">等待读取</p>
         </div>
         <div class="actions">
+          <button class="secondary-button" id="analyze-financials" type="button" disabled>
+            AI 分析
+          </button>
           <button class="primary-button" id="refresh-financials" type="button">
             <span aria-hidden="true">↻</span>
             刷新数据
@@ -45,6 +48,7 @@
 
       <section class="status-line" id="financial-status" role="status"></section>
       <section class="financial-method" id="financial-method" aria-label="数据口径"></section>
+      <section class="financial-ai-panel" id="financial-ai-panel" aria-label="大模型分析" hidden></section>
       <section class="financial-charts" id="financial-charts" aria-label="财务图表"></section>
       <div id="financial-table"></div>
     </main>

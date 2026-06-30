@@ -1,0 +1,15 @@
+{
+  "analysisProvider": "codex",
+  "codex": {
+    "command": "codex",
+    "model": "",
+    "timeoutMs": 180000,
+    "sandbox": "read-only"
+  },
+  "openai": {
+    "apiKey": "",
+    "model": "gpt-4.1-mini",
+    "baseUrl": "https://api.openai.com/v1",
+    "timeoutMs": 60000
+  }
+}

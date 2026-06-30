@@ -1,0 +1,48 @@
+{
+  "generatedAt": "2026-06-23",
+  "macroPolicy": {
+    "summary": "",
+    "monetaryPolicy": "",
+    "liquidity": "",
+    "demandEnvironment": "",
+    "riskFreeRate": "",
+    "notes": []
+  },
+  "industryViews": {
+    "default": {
+      "cycleStage": "",
+      "ceiling": "",
+      "demandDrivers": [],
+      "supplyConstraints": [],
+      "risks": []
+    },
+    "半导体": {
+      "cycleStage": "",
+      "ceiling": "",
+      "demandDrivers": [],
+      "supplyConstraints": [],
+      "risks": []
+    },
+    "电子元件": {
+      "cycleStage": "",
+      "ceiling": "",
+      "demandDrivers": [],
+      "supplyConstraints": [],
+      "risks": []
+    }
+  },
+  "companyOverrides": {
+    "cn:002384": {
+      "moatNotes": "",
+      "pricingPowerNotes": "",
+      "durabilityNotes": "",
+      "growthCertaintyNotes": ""
+    },
+    "us:NVDA": {
+      "moatNotes": "",
+      "pricingPowerNotes": "",
+      "durabilityNotes": "",
+      "growthCertaintyNotes": ""
+    }
+  }
+}

@@ -11,7 +11,14 @@ const state = {
   businessTranslations: {},
   translationRequests: new Set(),
   expandedBusinessDescriptions: new Set(),
-  financialCharts: []
+  financialCharts: [],
+  financialPayload: null,
+  financialAiAnalysis: null,
+  focusAutoSearchTimer: null,
+  focusAutoSearchValue: "",
+  rankingRequestId: 0,
+  rankingEventSource: null,
+  rankingProgressLog: []
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -26,6 +33,10 @@ function isAshareMarket() {
 
 function rankingEndpoint() {
   return isAshareMarket() ? "/api/ashare-rankings" : "/api/rankings";
+}
+
+function rankingStreamEndpoint() {
+  return isAshareMarket() ? "/api/ashare-rankings/stream" : "/api/rankings/stream";
 }
 
 function calendarEndpoint() {
@@ -81,6 +92,70 @@ function setStatus(id, message, type = "") {
   el.className = `status-line ${type}`;
 }
 
+function progressStageLabel(stage) {
+  return (
+    {
+      start: "开始",
+      cache: "缓存",
+      universe: "股票池",
+      calendar: "财报日历",
+      ticker: "CIK 匹配",
+      frames: "SEC 指标",
+      score: "评分",
+      filings: "财报补全",
+      text: "文本解析",
+      "next-earnings": "下次财报",
+      diagnostics: "异常整理",
+      "focused-analysis": "指定公司",
+      fallback: "普通请求",
+      error: "错误",
+      complete: "完成"
+    }[stage] || stage || "进度"
+  );
+}
+
+function closeRankingProgressStream() {
+  if (!state.rankingEventSource) return;
+  state.rankingEventSource.close();
+  state.rankingEventSource = null;
+}
+
+function resetRankingProgress(message = "准备开始") {
+  state.rankingProgressLog = [];
+  const panel = $("#ranking-progress");
+  if (!panel) return;
+  panel.hidden = false;
+  $("#ranking-progress-stage").textContent = "准备";
+  $("#ranking-progress-elapsed").textContent = "0.0 秒";
+  $("#ranking-progress-message").textContent = message;
+  $("#ranking-progress-log").innerHTML = "";
+}
+
+function hideRankingProgress() {
+  const panel = $("#ranking-progress");
+  if (panel) panel.hidden = true;
+}
+
+function updateRankingProgress(progress) {
+  const panel = $("#ranking-progress");
+  if (!panel) return;
+  panel.hidden = false;
+  const label = progressStageLabel(progress.stage);
+  const elapsed = Number(progress.elapsedMs || 0) / 1000;
+  $("#ranking-progress-stage").textContent = label;
+  $("#ranking-progress-elapsed").textContent = `${elapsed.toFixed(1)} 秒`;
+  $("#ranking-progress-message").textContent = progress.message || "";
+  const entry = `${elapsed.toFixed(1)}s · ${label} · ${progress.message || ""}`;
+  if (entry.trim()) {
+    const last = state.rankingProgressLog[state.rankingProgressLog.length - 1];
+    if (last !== entry) state.rankingProgressLog.push(entry);
+    state.rankingProgressLog = state.rankingProgressLog.slice(-8);
+    $("#ranking-progress-log").innerHTML = state.rankingProgressLog
+      .map((item) => `<li>${escapeHtml(item)}</li>`)
+      .join("");
+  }
+}
+
 async function fetchJson(url) {
   const response = await fetch(url);
   const payload = await response.json();
@@ -130,6 +205,72 @@ function rowSignalChips(row) {
   return `${custom}${defaultSignals}`;
 }
 
+function usStockSymbol(symbol) {
+  return String(symbol || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9.-]/g, "");
+}
+
+function domesticUsStockLinks(symbol) {
+  const safeSymbol = encodeURIComponent(usStockSymbol(symbol));
+  return [
+    { label: "东财", url: `https://quote.eastmoney.com/us/${safeSymbol}.html` },
+    { label: "雪球", url: `https://xueqiu.com/S/${safeSymbol}` },
+    { label: "新浪", url: `https://stock.finance.sina.com.cn/usstock/quotes/${safeSymbol}.html` }
+  ];
+}
+
+function primaryStockUrl(item, market = currentMarket()) {
+  if (market === "us") return domesticUsStockLinks(item.symbol)[0].url;
+  return item.stockUrl || "#";
+}
+
+function stockLinksHtml(item) {
+  const links = currentMarket() === "us"
+    ? domesticUsStockLinks(item.symbol)
+    : item.stockLinks?.length
+    ? item.stockLinks
+    : item.stockUrl
+      ? [{ label: "股票页", url: item.stockUrl }]
+      : [];
+  return links
+    .filter((link) => link.url)
+    .map(
+      (link) =>
+        `<a href="${escapeHtml(link.url)}" target="_blank" rel="noreferrer">${escapeHtml(
+          link.label || "股票页"
+        )}</a>`
+    )
+    .join("");
+}
+
+function nextEarningsCell(nextEarnings) {
+  if (!nextEarnings?.date) {
+    const note = nextEarnings?.note || "暂未找到下一次财报日期";
+    const label = nextEarnings?.label || "";
+    return `<div class="next-earnings-cell missing" title="${escapeHtml(note)}">
+      <span>未公布</span>
+      ${label ? `<small>${escapeHtml(label)}</small>` : ""}
+    </div>`;
+  }
+  const details = [
+    nextEarnings.label || "",
+    nextEarnings.time || "",
+    nextEarnings.epsForecast ? `EPS ${nextEarnings.epsForecast}` : ""
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const titleParts = [
+    nextEarnings.source || "",
+    nextEarnings.firstAppointmentDate ? `首次预约 ${nextEarnings.firstAppointmentDate}` : "",
+    nextEarnings.actualPublishDate ? `实际披露 ${nextEarnings.actualPublishDate}` : ""
+  ].filter(Boolean);
+  return `<div class="next-earnings-cell" title="${escapeHtml(titleParts.join("；"))}">
+    <strong>${escapeHtml(nextEarnings.date)}</strong>
+    <small>${escapeHtml(details || nextEarnings.reportDate || "")}</small>
+  </div>`;
+}
+
 function normalizeSearchText(value) {
   return String(value || "")
     .toLowerCase()
@@ -150,7 +291,8 @@ function parseCompanyFilters(value = "") {
     .forEach((chunk) => {
       push(chunk);
       const tokens = chunk.trim().split(/\s+/).filter(Boolean);
-      if (tokens.length > 1) tokens.forEach(push);
+      const looksLikeTickerList = tokens.length > 1 && tokens.every((token) => /^[A-Z0-9._-]{1,8}$/.test(token));
+      if (looksLikeTickerList) tokens.forEach(push);
     });
   return filters;
 }
@@ -176,6 +318,38 @@ function filteredRankingRows(rows) {
     filters,
     rows: filters.length ? rows.filter((row) => rowMatchesCompanyFilter(row, filters)) : rows
   };
+}
+
+function clearFocusAutoSearch() {
+  if (!state.focusAutoSearchTimer) return;
+  clearTimeout(state.focusAutoSearchTimer);
+  state.focusAutoSearchTimer = null;
+}
+
+function scheduleFocusAutoSearch() {
+  clearFocusAutoSearch();
+  const focusText = $("#focus-companies")?.value?.trim() || "";
+  const normalizedFocus = normalizeSearchText(focusText);
+  if (!normalizedFocus || normalizedFocus.length < 2) {
+    state.focusAutoSearchValue = "";
+    return;
+  }
+  const visibleRows = state.ranking ? filteredRankingRows(state.ranking.rows).rows : [];
+  if (visibleRows.length) {
+    state.focusAutoSearchValue = "";
+    return;
+  }
+  if (state.focusAutoSearchValue === normalizedFocus) return;
+  setStatus("#ranking-status", "当前列表未找到匹配公司，稍后自动生成指定公司结果...");
+  state.focusAutoSearchTimer = setTimeout(() => {
+    state.focusAutoSearchTimer = null;
+    const latestFocus = $("#focus-companies")?.value?.trim() || "";
+    if (normalizeSearchText(latestFocus) !== normalizedFocus) return;
+    const latestVisibleRows = state.ranking ? filteredRankingRows(state.ranking.rows).rows : [];
+    if (latestVisibleRows.length) return;
+    state.focusAutoSearchValue = normalizedFocus;
+    void loadRanking(false);
+  }, 700);
 }
 
 function readAnalysisOptions() {
@@ -311,6 +485,8 @@ function renderDiagnostics(payload) {
   const categories = payload.market === "cn" ? [
     ["manualCompanyMissing", "指定公司未匹配", "failure"],
     ["marketDataMissing", "估值/市值数据缺失", "failure"],
+    ["textDocsMissing", "财报 PDF 缺失", "failure"],
+    ["textScanFailures", "财报 PDF 解析失败", "failure"],
     ["notEnrichedDueLimit", "候选超过展示上限", "failure"],
     ["noPositiveScore", "有数据但未触发亮眼条件", "neutral"]
   ] : [
@@ -355,6 +531,10 @@ function sortableValue(row, key) {
   if (key === "score") return row.score;
   if (key === "filingDate") {
     const time = Date.parse(row.filing?.filingDate || "");
+    return Number.isNaN(time) ? null : time;
+  }
+  if (key === "nextEarningsDate") {
+    const time = Date.parse(row.nextEarnings?.date || "");
     return Number.isNaN(time) ? null : time;
   }
   if (key === "revenue") return growthSortValue(row.metrics?.revenue);
@@ -460,12 +640,12 @@ function renderRanking(payload, options = {}) {
 
   const body = $("#ranking-body");
   if (!payload.rows.length) {
-    body.innerHTML = '<tr><td colspan="9" class="empty-cell">当前股票池暂无符合条件的财报。</td></tr>';
+    body.innerHTML = '<tr><td colspan="10" class="empty-cell">当前股票池暂无符合条件的财报。</td></tr>';
     return;
   }
   if (!rowsToDisplay.length) {
     body.innerHTML =
-      '<tr><td colspan="9" class="empty-cell">未找到匹配指定公司的结果；清空“指定公司”后可查看全部。</td></tr>';
+      '<tr><td colspan="10" class="empty-cell">未找到匹配指定公司的结果；清空“指定公司”后可查看全部。</td></tr>';
     return;
   }
 
@@ -487,7 +667,7 @@ function renderRanking(payload, options = {}) {
         <td class="rank-cell">${index + 1}</td>
         <td>
           <div class="company-cell">
-            <a href="${escapeHtml(row.stockUrl)}" target="_blank" rel="noreferrer">${escapeHtml(
+            <a href="${escapeHtml(primaryStockUrl(row, payload.market))}" target="_blank" rel="noreferrer">${escapeHtml(
         row.symbol
       )}</a>
             ${row.forced ? '<span class="manual-badge">指定</span>' : ""}
@@ -505,12 +685,13 @@ function renderRanking(payload, options = {}) {
           <div>${escapeHtml(row.filing.form)} · ${escapeHtml(row.filing.reportDate || "--")}</div>
           <div class="muted">提交 ${escapeHtml(row.filing.filingDate)}</div>
         </td>
+        <td>${nextEarningsCell(row.nextEarnings)}</td>
         <td>${revenue}<div class="muted">${escapeHtml(row.metrics.revenue?.current?.display || "")}</div></td>
         <td>${netIncome}<div class="muted">${escapeHtml(row.metrics.netIncome?.current?.display || "")}</div></td>
         <td>${margin || '<span class="muted">--</span>'}</td>
         <td><div class="signal-list">${rowSignalChips(row)}</div></td>
         <td class="link-cell">
-          <a href="${escapeHtml(row.stockUrl)}" target="_blank" rel="noreferrer">股票页</a>
+          ${stockLinksHtml(row)}
           <a href="${escapeHtml(row.filing.url)}" target="_blank" rel="noreferrer">财报</a>
           <a href="${escapeHtml(financialsUrl(row.symbol, payload.market, row.name))}" target="_blank" rel="noreferrer">财务分析</a>
         </td>
@@ -524,13 +705,20 @@ function renderRanking(payload, options = {}) {
 }
 
 async function loadRanking(force = false) {
+  clearFocusAutoSearch();
+  closeRankingProgressStream();
+  const requestId = ++state.rankingRequestId;
   const button = $("#refresh-ranking");
   const applyButtons = [$("#apply-ranking"), $("#apply-ranking-inline")].filter(Boolean);
-  button.disabled = true;
-  applyButtons.forEach((applyButton) => {
-    applyButton.disabled = true;
-  });
-  button.classList.add("loading");
+  const setLoading = (loading) => {
+    button.disabled = loading;
+    applyButtons.forEach((applyButton) => {
+      applyButton.disabled = loading;
+    });
+    button.classList.toggle("loading", loading);
+  };
+  setLoading(true);
+  resetRankingProgress(force ? "准备强制刷新数据..." : "准备读取缓存或刷新数据...");
   setStatus(
     "#ranking-status",
     force
@@ -539,10 +727,88 @@ async function loadRanking(force = false) {
         : "正在从 SEC 刷新，首次可能需要几十秒到一两分钟..."
       : "正在应用设置并读取缓存..."
   );
+  persistAnalysisOptions();
+  const query = rankingQuery(force);
+
+  if (window.EventSource) {
+    const source = new EventSource(`${rankingStreamEndpoint()}${query ? `?${query}` : ""}`);
+    state.rankingEventSource = source;
+    let completed = false;
+
+    source.addEventListener("progress", (event) => {
+      if (requestId !== state.rankingRequestId) return;
+      const progress = JSON.parse(event.data);
+      updateRankingProgress(progress);
+      setStatus("#ranking-status", `${progressStageLabel(progress.stage)}：${progress.message || ""}`);
+    });
+
+    source.addEventListener("result", (event) => {
+      if (requestId !== state.rankingRequestId) {
+        source.close();
+        return;
+      }
+      completed = true;
+      source.close();
+      state.rankingEventSource = null;
+      const payload = JSON.parse(event.data);
+      renderRanking(payload);
+      const timing = payload.cache === "hit" ? "命中缓存" : `用时 ${(payload.elapsedMs / 1000).toFixed(1)} 秒`;
+      const forcedText = payload.totals.forced ? `，指定分析 ${payload.totals.forced} 家` : "";
+      updateRankingProgress({
+        stage: "complete",
+        message: `完成：${payload.totals.ranked} 家入榜${forcedText}，${timing}。`,
+        elapsedMs: payload.elapsedMs || 0
+      });
+      setStatus(
+        "#ranking-status",
+        `完成：${payload.totals.ranked} 家入榜${forcedText}，${timing}。`,
+        "ok"
+      );
+      setLoading(false);
+    });
+
+    source.addEventListener("ranking-error", (event) => {
+      if (requestId !== state.rankingRequestId) {
+        source.close();
+        return;
+      }
+      completed = true;
+      source.close();
+      state.rankingEventSource = null;
+      const payload = JSON.parse(event.data);
+      updateRankingProgress({
+        stage: "error",
+        message: payload.error || "刷新失败",
+        elapsedMs: payload.elapsedMs || 0
+      });
+      setStatus("#ranking-status", `刷新失败：${payload.error || "未知错误"}`, "error");
+      setLoading(false);
+    });
+
+    source.onerror = () => {
+      if (completed || requestId !== state.rankingRequestId) return;
+      completed = true;
+      source.close();
+      state.rankingEventSource = null;
+      updateRankingProgress({
+        stage: "error",
+        message: "进度连接中断，请重试",
+        elapsedMs: 0
+      });
+      setStatus("#ranking-status", "刷新失败：进度连接中断，请重试。", "error");
+      setLoading(false);
+    };
+    return;
+  }
+
   try {
-    persistAnalysisOptions();
-    const query = rankingQuery(force);
+    updateRankingProgress({
+      stage: "fallback",
+      message: "当前浏览器不支持流式进度，改用普通请求",
+      elapsedMs: 0
+    });
     const payload = await fetchJson(`${rankingEndpoint()}${query ? `?${query}` : ""}`);
+    if (requestId !== state.rankingRequestId) return;
     renderRanking(payload);
     const timing = payload.cache === "hit" ? "命中缓存" : `用时 ${(payload.elapsedMs / 1000).toFixed(1)} 秒`;
     const forcedText = payload.totals.forced ? `，指定分析 ${payload.totals.forced} 家` : "";
@@ -552,13 +818,11 @@ async function loadRanking(force = false) {
       "ok"
     );
   } catch (error) {
+    if (requestId !== state.rankingRequestId) return;
     setStatus("#ranking-status", `刷新失败：${error.message}`, "error");
   } finally {
-    button.disabled = false;
-    applyButtons.forEach((applyButton) => {
-      applyButton.disabled = false;
-    });
-    button.classList.remove("loading");
+    if (requestId !== state.rankingRequestId) return;
+    setLoading(false);
   }
 }
 
@@ -743,6 +1007,7 @@ function renderDayPanel(date) {
           }
         </div>
         <div class="event-meta">
+          ${item.eventTypeLabel ? `<span class="event-type-badge">${escapeHtml(item.eventTypeLabel)}</span>` : ""}
           <span>${timeLabel(item.time)}</span>
           ${megaCap ? "<span class=\"mega-cap-badge\">千亿市值</span>" : ""}
           <span>市值 ${escapeHtml(formatMarketCap(item.marketCap, item.marketCapCurrency || "$"))}</span>
@@ -750,6 +1015,16 @@ function renderDayPanel(date) {
           <span>${escapeHtml(item.metricLabel || `EPS ${item.epsForecast || "--"}`)}</span>
           ${industry ? `<span>${escapeHtml(industry)}</span>` : ""}
         </div>
+        ${
+          item.eventSummary
+            ? `<p class="event-highlight">${escapeHtml(item.eventSummary)}</p>`
+            : ""
+        }
+        ${
+          item.eventReason
+            ? `<p class="event-reason">${escapeHtml(item.eventReason)}</p>`
+            : ""
+        }
         <div class="event-business-block">
           <p class="event-business">${escapeHtml(description)}</p>
           <div class="event-business-actions">
@@ -772,7 +1047,7 @@ function renderDayPanel(date) {
           </div>
         </div>
         <div class="link-cell">
-          <a href="${escapeHtml(item.stockUrl)}" target="_blank" rel="noreferrer">股票页</a>
+          ${stockLinksHtml(item)}
           <a href="${escapeHtml(item.nasdaqUrl)}" target="_blank" rel="noreferrer">${escapeHtml(
             item.calendarLabel || "日历页"
           )}</a>
@@ -805,6 +1080,7 @@ function renderDayPanel(date) {
 
 function renderCalendar(payload) {
   state.calendar = payload;
+  $("#month-input").value = payload.month || $("#month-input").value || currentMonth();
   $("#calendar-subtitle").textContent = `${payload.month} | ${payload.totalEvents} 个财报事件 | 更新 ${formatDateTime(payload.generatedAt)}`;
   const grid = $("#calendar-grid");
   const [year, monthIndex] = payload.month.split("-").map(Number);
@@ -821,16 +1097,19 @@ function renderCalendar(payload) {
     const date = `${payload.month}-${String(day).padStart(2, "0")}`;
     const events = payload.byDate[date] || [];
     const hasMegaCap = events.some(isMegaCap);
+    const previewLimit = isAshareMarket() ? 4 : 5;
     const preview = events
-      .slice(0, 5)
+      .slice(0, previewLimit)
       .map(
-        (item) =>
-          `<span class="${isMegaCap(item) ? "is-mega-cap" : ""}">${escapeHtml(
-            item.symbol
-          )}</span>`
+        (item) => {
+          const label = isAshareMarket() ? item.name || item.symbol : item.symbol;
+          return `<span class="${isMegaCap(item) ? "is-mega-cap" : ""}" title="${escapeHtml(
+            `${item.name || item.symbol} ${item.symbol || ""}`.trim()
+          )}">${escapeHtml(label)}</span>`;
+        }
       )
       .join("");
-    const more = events.length > 5 ? `<em>+${events.length - 5}</em>` : "";
+    const more = events.length > previewLimit ? `<em>+${events.length - previewLimit}</em>` : "";
     cells.push(`<button class="calendar-cell ${events.length ? "has-events" : ""} ${
       hasMegaCap ? "has-mega-cap" : ""
     }" data-date="${date}" type="button">
@@ -861,7 +1140,7 @@ function renderCalendar(payload) {
 }
 
 async function loadCalendar(force = false) {
-  const month = $("#month-input").value || currentMonth();
+  const month = $("#month-input").value || (isAshareMarket() ? "" : currentMonth());
   const button = $("#refresh-calendar");
   button.disabled = true;
   button.classList.add("loading");
@@ -874,9 +1153,10 @@ async function loadCalendar(force = false) {
       : "正在读取日历..."
   );
   try {
-    const payload = await fetchJson(
-      `${calendarEndpoint()}?month=${encodeURIComponent(month)}${force ? "&force=1" : ""}`
-    );
+    const params = new URLSearchParams();
+    if (month) params.set("month", month);
+    if (force) params.set("force", "1");
+    const payload = await fetchJson(`${calendarEndpoint()}?${params.toString()}`);
     renderCalendar(payload);
     setStatus(
       "#calendar-status",
@@ -1168,9 +1448,151 @@ function renderFinancialMethod(payload) {
   </div>`;
 }
 
+function listHtml(items) {
+  if (!items?.length) return '<p class="muted">暂无明确结论。</p>';
+  return `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
+function renderFinancialAiSection(title, items) {
+  return `<div class="ai-analysis-section">
+    <h3>${escapeHtml(title)}</h3>
+    ${listHtml(items)}
+  </div>`;
+}
+
+function evidenceStatusLabel(status) {
+  return {
+    ok: "已获取",
+    partial: "部分",
+    missing: "缺失",
+    failed: "失败"
+  }[status] || status || "--";
+}
+
+function evidenceStatusClass(status) {
+  if (status === "ok") return "good";
+  if (status === "failed") return "bad";
+  return "muted";
+}
+
+function renderEvidenceCoverage(evidencePackage) {
+  const coverage = evidencePackage?.coverage || [];
+  if (!coverage.length) return "";
+  return `<div class="ai-evidence-card">
+    <div class="ai-evidence-title">
+      <h3>资料覆盖</h3>
+      <span>${escapeHtml(evidencePackage.source || "自动资料包")}</span>
+    </div>
+    <div class="ai-evidence-grid">
+      ${coverage
+        .map(
+          (item) => `<div class="ai-evidence-item">
+            <strong>${escapeHtml(item.title || item.category || "")}</strong>
+            <span class="${evidenceStatusClass(item.status)}">${escapeHtml(evidenceStatusLabel(item.status))}</span>
+            ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">来源</a>` : ""}
+            ${item.excerptCount ? `<small>${escapeHtml(`摘录 ${item.excerptCount} 条`)}</small>` : ""}
+            ${item.reason ? `<p>${escapeHtml(item.reason)}</p>` : ""}
+          </div>`
+        )
+        .join("")}
+    </div>
+  </div>`;
+}
+
+function renderFinancialAiPanel(payload) {
+  const panel = $("#financial-ai-panel");
+  if (!panel) return;
+  panel.hidden = false;
+  if (payload.status === "loading") {
+    panel.innerHTML = `<section class="ai-analysis-card">
+      <div class="ai-analysis-header">
+        <div>
+          <span>大模型分析</span>
+          <h2>正在分析财务报表...</h2>
+        </div>
+      </div>
+      <p class="muted">仅在本次点击后调用模型，分析输入为当前页面已展示的结构化财务数据、公司主营资料和本地宏观行业上下文。</p>
+    </section>`;
+    return;
+  }
+  if (payload.status === "disabled") {
+    panel.innerHTML = `<section class="ai-analysis-card">
+      <div class="ai-analysis-header">
+        <div>
+          <span>大模型分析</span>
+          <h2>未启用</h2>
+        </div>
+      </div>
+      <p>${escapeHtml(payload.message || "未配置大模型 API Key。")}</p>
+      <code class="setup-line">${escapeHtml(payload.setup || "OPENAI_API_KEY=\"你的 key\" npm start")}</code>
+    </section>`;
+    return;
+  }
+  if (payload.status === "error") {
+    panel.innerHTML = `<section class="ai-analysis-card">
+      <div class="ai-analysis-header">
+        <div>
+          <span>大模型分析</span>
+          <h2>分析失败</h2>
+        </div>
+        <button class="secondary-button" id="rerun-financial-ai" type="button">重试</button>
+      </div>
+      <p class="bad">${escapeHtml(payload.message || "调用失败")}</p>
+    </section>`;
+    $("#rerun-financial-ai")?.addEventListener("click", () => loadFinancialAiAnalysis(true));
+    return;
+  }
+  const analysis = payload.analysis || {};
+  const providerLabel = payload.provider === "codex" ? "Codex" : payload.provider === "openai" ? "OpenAI" : "AI";
+  panel.innerHTML = `<section class="ai-analysis-card">
+    <div class="ai-analysis-header">
+      <div>
+        <span>大模型分析</span>
+        <h2>${escapeHtml(payload.symbol || "")} ${escapeHtml(payload.name || "")}</h2>
+      </div>
+      <div class="ai-analysis-actions">
+        <small>${providerLabel} · ${escapeHtml(payload.model || "")} · ${payload.cache === "hit" ? "缓存" : "新分析"} · ${escapeHtml(formatDateTime(payload.generatedAt))}</small>
+        <button class="secondary-button" id="rerun-financial-ai" type="button">重新分析</button>
+      </div>
+    </div>
+    <p class="ai-summary">${escapeHtml(analysis.summary || "")}</p>
+    <div class="ai-overall">${escapeHtml(analysis.overall || "")}</div>
+    ${renderEvidenceCoverage(payload.evidencePackage)}
+    <div class="ai-analysis-grid">
+      ${renderFinancialAiSection("增长", analysis.growth)}
+      ${renderFinancialAiSection("盈利能力", analysis.profitability)}
+      ${renderFinancialAiSection("现金流", analysis.cashFlow)}
+      ${renderFinancialAiSection("资产负债", analysis.balanceSheet)}
+      ${renderFinancialAiSection("产品壁垒/垄断性", analysis.productMoat)}
+      ${renderFinancialAiSection("定价权", analysis.pricingPower)}
+      ${renderFinancialAiSection("持续性", analysis.durability)}
+      ${renderFinancialAiSection("经济/货币政策", analysis.macroPolicy)}
+      ${renderFinancialAiSection("行业景气天花板", analysis.industryCeiling)}
+      ${renderFinancialAiSection("增速确定性", analysis.growthCertainty)}
+      ${renderFinancialAiSection("风险与异常", analysis.risks)}
+      ${renderFinancialAiSection("后续关注", analysis.watchItems)}
+    </div>
+    <div class="ai-analysis-section ai-data-quality">
+      <h3>数据准确性口径</h3>
+      ${listHtml([...(payload.accuracyNotes || []), ...(analysis.dataQuality || [])])}
+    </div>
+    <p class="ai-disclaimer">${escapeHtml(analysis.disclaimer || "本分析仅基于公开结构化财务数据，不构成投资建议。")}</p>
+  </section>`;
+  $("#rerun-financial-ai")?.addEventListener("click", () => loadFinancialAiAnalysis(true));
+}
+
 function renderFinancials(payload) {
   const points = financialDisplayPoints(payload);
   const name = payload.name || financialPageParams().name || payload.symbol;
+  state.financialPayload = payload;
+  state.financialAiAnalysis = null;
+  const aiPanel = $("#financial-ai-panel");
+  if (aiPanel) {
+    aiPanel.hidden = true;
+    aiPanel.innerHTML = "";
+  }
+  const aiButton = $("#analyze-financials");
+  if (aiButton) aiButton.disabled = false;
   $("#financial-title").textContent = `${payload.symbol} ${name}`;
   $("#financial-subtitle").textContent = `${payload.market === "cn" ? "A股" : "美股"} | ${payload.source} | 更新 ${formatDateTime(
     payload.generatedAt
@@ -1185,6 +1607,32 @@ function renderFinancials(payload) {
   }
   renderFinancialCharts(payload, points);
   $("#financial-table").innerHTML = renderFinancialTable(payload, points);
+}
+
+async function loadFinancialAiAnalysis(force = false) {
+  const params = financialPageParams();
+  const button = $("#analyze-financials");
+  if (button) {
+    button.disabled = true;
+    button.classList.add("loading");
+    button.textContent = force ? "重新分析中" : "AI 分析中";
+  }
+  renderFinancialAiPanel({ status: "loading" });
+  try {
+    const payload = await fetchJson(
+      `/api/financials/analyze?market=${encodeURIComponent(params.market)}&symbol=${encodeURIComponent(params.symbol)}${force ? "&force=1" : ""}`
+    );
+    state.financialAiAnalysis = payload;
+    renderFinancialAiPanel(payload);
+  } catch (error) {
+    renderFinancialAiPanel({ status: "error", message: error.message });
+  } finally {
+    if (button) {
+      button.disabled = !state.financialPayload;
+      button.classList.remove("loading");
+      button.textContent = "AI 分析";
+    }
+  }
 }
 
 async function loadFinancials(force = false) {
@@ -1219,6 +1667,7 @@ function initFinancials() {
     return;
   }
   $("#refresh-financials")?.addEventListener("click", () => loadFinancials(true));
+  $("#analyze-financials")?.addEventListener("click", () => loadFinancialAiAnalysis(false));
   window.addEventListener("resize", () => {
     state.financialCharts.forEach((chart) => chart.resize());
   });
@@ -1237,6 +1686,7 @@ function initRanking() {
   $("#focus-companies")?.addEventListener("input", () => {
     persistAnalysisOptions();
     if (state.ranking) renderRanking(state.ranking);
+    scheduleFocusAutoSearch();
   });
   $("#focus-companies")?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
@@ -1253,14 +1703,14 @@ function initRanking() {
 
 function initCalendar() {
   const monthInput = $("#month-input");
-  monthInput.value = currentMonth();
+  monthInput.value = isAshareMarket() ? "" : currentMonth();
   $("#refresh-calendar").addEventListener("click", () => loadCalendar(true));
   $("#prev-month").addEventListener("click", () => {
-    monthInput.value = shiftMonth(monthInput.value, -1);
+    monthInput.value = shiftMonth(monthInput.value || currentMonth(), -1);
     loadCalendar(false);
   });
   $("#next-month").addEventListener("click", () => {
-    monthInput.value = shiftMonth(monthInput.value, 1);
+    monthInput.value = shiftMonth(monthInput.value || currentMonth(), 1);
     loadCalendar(false);
   });
   monthInput.addEventListener("change", () => loadCalendar(false));

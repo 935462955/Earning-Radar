@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>A股财报亮眼度排名</title>
-    <link rel="stylesheet" href="/styles.css" />
-    <script src="/app.js" defer></script>
+    <link rel="stylesheet" href="/styles.css?v=20260630b" />
+    <script src="/app.js?v=20260630b" defer></script>
   </head>
   <body data-page="ranking" data-market="cn">
     <header class="topbar">
@@ -120,6 +120,15 @@
 
       <section class="status-line" id="ranking-status" role="status"></section>
 
+      <section class="progress-panel" id="ranking-progress" hidden>
+        <div class="progress-header">
+          <strong id="ranking-progress-stage">准备</strong>
+          <span id="ranking-progress-elapsed">0.0 秒</span>
+        </div>
+        <div class="progress-message" id="ranking-progress-message"></div>
+        <ol class="progress-log" id="ranking-progress-log"></ol>
+      </section>
+
       <section class="table-panel">
         <div class="table-scroll">
           <table class="ranking-table">
@@ -129,8 +138,9 @@
                 <th><button class="sort-button" type="button" data-sort-key="symbol">公司 <span class="sort-indicator" data-sort-indicator="symbol">↕</span></button></th>
                 <th><button class="sort-button" type="button" data-sort-key="score">分数 <span class="sort-indicator" data-sort-indicator="score">↓</span></button></th>
                 <th><button class="sort-button" type="button" data-sort-key="filingDate">财报披露 <span class="sort-indicator" data-sort-indicator="filingDate">↕</span></button></th>
+                <th><button class="sort-button" type="button" data-sort-key="nextEarningsDate">下次财报 <span class="sort-indicator" data-sort-indicator="nextEarningsDate">↕</span></button></th>
                 <th><button class="sort-button" type="button" data-sort-key="revenue">营收同比 <span class="sort-indicator" data-sort-indicator="revenue">↕</span></button></th>
-                <th><button class="sort-button" type="button" data-sort-key="netIncome">净利同比 <span class="sort-indicator" data-sort-indicator="netIncome">↕</span></button></th>
+                <th><button class="sort-button" type="button" data-sort-key="netIncome">归母净利 <span class="sort-indicator" data-sort-indicator="netIncome">↕</span></button></th>
                 <th><button class="sort-button" type="button" data-sort-key="margin">利润率变化 <span class="sort-indicator" data-sort-indicator="margin">↕</span></button></th>
                 <th><button class="sort-button" type="button" data-sort-key="signals">景气度信号 <span class="sort-indicator" data-sort-indicator="signals">↕</span></button></th>
                 <th>链接</th>
@@ -138,7 +148,7 @@
             </thead>
             <tbody id="ranking-body">
               <tr>
-                <td colspan="9" class="empty-cell">点击刷新数据开始扫描。</td>
+                <td colspan="10" class="empty-cell">点击刷新数据开始扫描。</td>
               </tr>
             </tbody>
           </table>

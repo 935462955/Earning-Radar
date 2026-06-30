@@ -12,6 +12,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "echarts": "^6.1.0"
+    "echarts": "^6.1.0",
+    "pdf-parse": "^2.4.5"
   }
 }
