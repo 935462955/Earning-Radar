@@ -76,6 +76,13 @@ function pctPoint(value) {
   return `${(value * 100).toFixed(1)}pct`;
 }
 
+function signedPct(value) {
+  if (value == null || Number.isNaN(Number(value))) return "--";
+  const number = Number(value);
+  const sign = number > 0 ? "+" : "";
+  return `${sign}${(number * 100).toFixed(1)}%`;
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -105,6 +112,7 @@ function progressStageLabel(stage) {
       filings: "财报补全",
       text: "文本解析",
       "next-earnings": "下次财报",
+      "price-reaction": "公告后验证",
       diagnostics: "异常整理",
       "focused-analysis": "指定公司",
       fallback: "普通请求",
@@ -268,6 +276,70 @@ function nextEarningsCell(nextEarnings) {
   return `<div class="next-earnings-cell" title="${escapeHtml(titleParts.join("；"))}">
     <strong>${escapeHtml(nextEarnings.date)}</strong>
     <small>${escapeHtml(details || nextEarnings.reportDate || "")}</small>
+  </div>`;
+}
+
+function reactionTone(reaction) {
+  if (!reaction || reaction.status === "missing" || reaction.status === "error") return "missing";
+  if (reaction.status === "pending") return "pending";
+  const pctValue = reaction.post20?.pct ?? reaction.post5?.pct ?? reaction.postLatest?.pct;
+  if (pctValue == null) return "pending";
+  if (pctValue <= -0.05) return "bad";
+  if (pctValue >= 0.05) return "good";
+  return "neutral";
+}
+
+function announcementReactionCell(reaction) {
+  if (!reaction) return '<span class="muted">--</span>';
+  const postLabel = reaction.post20
+    ? `T+20 ${signedPct(reaction.post20.pct)}`
+    : reaction.post5
+      ? `T+5 ${signedPct(reaction.post5.pct)}`
+      : reaction.postLatest
+        ? `最新 ${signedPct(reaction.postLatest.pct)}`
+        : "等待交易";
+  const title = [
+    reaction.source || "",
+    reaction.baseTiming ? `${reaction.baseTiming} ${reaction.baseDate || ""}` : "",
+    reaction.pre20 ? `前20交易日 ${signedPct(reaction.pre20.pct)} (${reaction.pre20.fromDate}→${reaction.pre20.toDate})` : "",
+    reaction.post5 ? `T+5 ${signedPct(reaction.post5.pct)} (${reaction.post5.fromDate}→${reaction.post5.toDate})` : "",
+    reaction.post20 ? `T+20 ${signedPct(reaction.post20.pct)} (${reaction.post20.fromDate}→${reaction.post20.toDate})` : "",
+    reaction.note || ""
+  ]
+    .filter(Boolean)
+    .join("；");
+  return `<div class="reaction-cell ${reactionTone(reaction)}" title="${escapeHtml(title)}">
+    <strong>${escapeHtml(reaction.conclusion || "--")}</strong>
+    <small>前20 ${signedPct(reaction.pre20?.pct)} / ${escapeHtml(postLabel)}</small>
+    <small>${escapeHtml(reaction.baseDate ? `基准 ${reaction.baseDate}` : reaction.eventDate || "")}</small>
+  </div>`;
+}
+
+function previewTone(preview) {
+  if (!preview || preview.status !== "ok") return "missing";
+  if (preview.tone) return preview.tone;
+  if ((preview.confirmScore || 0) - (preview.riskScore || 0) >= 20) return "good";
+  if ((preview.riskScore || 0) - (preview.confirmScore || 0) >= 20) return "bad";
+  return "neutral";
+}
+
+function announcementPreviewCell(preview) {
+  if (!preview) return '<span class="muted">--</span>';
+  const title = [
+    preview.source || "",
+    preview.note || "",
+    preview.pre20 ? `前20交易日 ${signedPct(preview.pre20.pct)} (${preview.pre20.fromDate}→${preview.pre20.toDate})` : "",
+    preview.pre60 ? `前60交易日 ${signedPct(preview.pre60.pct)} (${preview.pre60.fromDate}→${preview.pre60.toDate})` : "",
+    preview.confirmReasons?.length ? `确认因素：${preview.confirmReasons.join("；")}` : "",
+    preview.riskReasons?.length ? `兑现风险：${preview.riskReasons.join("；")}` : ""
+  ]
+    .filter(Boolean)
+    .join("；");
+  const reasonText = preview.reasons?.length ? preview.reasons.slice(0, 2).join(" / ") : preview.note || "";
+  return `<div class="reaction-cell preview-cell ${previewTone(preview)}" title="${escapeHtml(title)}">
+    <strong>${escapeHtml(preview.conclusion || "--")}</strong>
+    <small>确认 ${escapeHtml(preview.confirmScore ?? "--")} / 风险 ${escapeHtml(preview.riskScore ?? "--")}</small>
+    <small>${escapeHtml(reasonText)}</small>
   </div>`;
 }
 
@@ -537,6 +609,14 @@ function sortableValue(row, key) {
     const time = Date.parse(row.nextEarnings?.date || "");
     return Number.isNaN(time) ? null : time;
   }
+  if (key === "reaction") {
+    return row.announcementReaction?.post20?.pct ?? row.announcementReaction?.postLatest?.pct ?? null;
+  }
+  if (key === "preview") {
+    const preview = row.announcementPreview;
+    if (!preview || preview.status !== "ok") return null;
+    return Number(preview.confirmScore || 0) - Number(preview.riskScore || 0);
+  }
   if (key === "revenue") return growthSortValue(row.metrics?.revenue);
   if (key === "netIncome") return growthSortValue(row.metrics?.netIncome);
   if (key === "margin") {
@@ -603,6 +683,8 @@ function setRankingSort(key) {
   const descendingByDefault = new Set([
     "score",
     "filingDate",
+    "preview",
+    "reaction",
     "revenue",
     "netIncome",
     "margin",
@@ -640,12 +722,12 @@ function renderRanking(payload, options = {}) {
 
   const body = $("#ranking-body");
   if (!payload.rows.length) {
-    body.innerHTML = '<tr><td colspan="10" class="empty-cell">当前股票池暂无符合条件的财报。</td></tr>';
+    body.innerHTML = '<tr><td colspan="12" class="empty-cell">当前股票池暂无符合条件的财报。</td></tr>';
     return;
   }
   if (!rowsToDisplay.length) {
     body.innerHTML =
-      '<tr><td colspan="10" class="empty-cell">未找到匹配指定公司的结果；清空“指定公司”后可查看全部。</td></tr>';
+      '<tr><td colspan="12" class="empty-cell">未找到匹配指定公司的结果；清空“指定公司”后可查看全部。</td></tr>';
     return;
   }
 
@@ -686,6 +768,8 @@ function renderRanking(payload, options = {}) {
           <div class="muted">提交 ${escapeHtml(row.filing.filingDate)}</div>
         </td>
         <td>${nextEarningsCell(row.nextEarnings)}</td>
+        <td>${announcementPreviewCell(row.announcementPreview)}</td>
+        <td>${announcementReactionCell(row.announcementReaction)}</td>
         <td>${revenue}<div class="muted">${escapeHtml(row.metrics.revenue?.current?.display || "")}</div></td>
         <td>${netIncome}<div class="muted">${escapeHtml(row.metrics.netIncome?.current?.display || "")}</div></td>
         <td>${margin || '<span class="muted">--</span>'}</td>
@@ -1193,7 +1277,7 @@ function compactNumber(value, digits = 2) {
   if (!Number.isFinite(value)) return "--";
   return Number(value).toLocaleString("zh-CN", {
     maximumFractionDigits: digits,
-    minimumFractionDigits: Math.abs(value) >= 100 ? 0 : 1
+    minimumFractionDigits: digits === 0 || Math.abs(value) >= 100 ? 0 : 1
   });
 }
 
@@ -1201,6 +1285,7 @@ function formatFinancialValue(value, payload, unit = "money") {
   if (value == null || Number.isNaN(Number(value))) return "--";
   if (unit === "percent") return pct(Number(value));
   if (unit === "ratio") return `${compactNumber(Number(value), 2)}x`;
+  if (unit === "count") return `${Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 0 })}户`;
   return `${compactNumber(Number(value) / (payload.unitDivisor || 1), 2)}${payload.unitLabel || ""}`;
 }
 
@@ -1272,10 +1357,12 @@ function financialTooltipFormatter(payload, metricMap) {
         const key = item.seriesId || item.seriesName;
         const metric = metricMap[key] || { unit: "money" };
         const value = Array.isArray(item.value) ? item.value[1] : item.value;
+        if (value == null || Number.isNaN(Number(value))) return "";
+        const rawPrefix = ["count", "percent", "ratio"].includes(metric.unit) ? "" : payload.currency;
         return `<div class="tooltip-row">
           <span>${item.marker}${escapeHtml(item.seriesName)}</span>
           <strong>${escapeHtml(formatFinancialValue(value, payload, metric.unit))}</strong>
-          <em>${escapeHtml(rawFinancialValue(value, metric.unit === "percent" ? "" : payload.currency))}</em>
+          <em>${escapeHtml(rawFinancialValue(value, rawPrefix))}</em>
         </div>`;
       })
       .join("");
@@ -1289,6 +1376,13 @@ function moneyAxisFormatter(payload) {
 
 function percentAxisFormatter(value) {
   return pct(Number(value));
+}
+
+function countAxisFormatter(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  if (Math.abs(number) >= 10000) return `${compactNumber(number / 10000, 2)}万户`;
+  return `${compactNumber(number, 0)}户`;
 }
 
 function financialSeries(payload, points, key, options = {}) {
@@ -1337,15 +1431,82 @@ function baseFinancialChartOption(title, payload, points, yAxes, series) {
   };
 }
 
-function chartContainer(title, id) {
-  return `<section class="chart-card">
+function chartContainer(title, id, wide = false) {
+  return `<section class="chart-card${wide ? " is-wide" : ""}">
     <div class="chart-container" id="${escapeHtml(id)}" role="img" aria-label="${escapeHtml(title)}"></div>
   </section>`;
 }
 
+function marketCapChartPoints(payload, points) {
+  const latest = payload.latestMarketCap || {};
+  const latestValue = Number(latest.value);
+  if (!Number.isFinite(latestValue)) return points;
+  const lastPoint = points[points.length - 1] || {};
+  const lastMarketDate = lastPoint.marketCapTradeDate || lastPoint.date || "";
+  if (latest.tradeDate && lastMarketDate && latest.tradeDate <= lastMarketDate) return points;
+  return [
+    ...points,
+    {
+      date: latest.tradeDate || "",
+      periodLabel: latest.tradeDate ? `最新市值\n${latest.tradeDate.slice(5)}` : "最新市值",
+      marketCap: latestValue,
+      revenue: null,
+      netIncome: null,
+      isLatestMarketCap: true
+    }
+  ];
+}
+
+function shareholderDisplayPoints(payload) {
+  return (payload.shareholderTrend || [])
+    .filter((point) => point.date && Number.isFinite(Number(point.shareholderCount)))
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+    .slice(-40);
+}
+
 function renderFinancialCharts(payload, points) {
   disposeFinancialCharts();
+  const marketPoints = marketCapChartPoints(payload, points);
+  const shareholderPoints = shareholderDisplayPoints(payload);
   const chartDefs = [
+    {
+      id: "financial-chart-market-cap",
+      title: "市值与营收/净利润（季度 + 最新市值）",
+      wide: true,
+      points: marketPoints,
+      yAxes: [
+        { type: "value", name: `财报/${payload.unitLabel}`, axisLabel: { formatter: moneyAxisFormatter(payload) }, splitLine: { lineStyle: { color: "#edf1f7" } } },
+        { type: "value", name: `市值/${payload.unitLabel}`, axisLabel: { formatter: moneyAxisFormatter(payload) }, splitLine: { show: false } }
+      ],
+      series: [
+        financialSeries(payload, marketPoints, "revenue", { type: "bar", color: "#2563eb" }),
+        financialSeries(payload, marketPoints, "netIncome", { type: "bar", color: "#10b981" }),
+        financialSeries(payload, marketPoints, "marketCap", { type: "line", yAxisIndex: 1, color: "#111827" })
+      ]
+    },
+    ...(shareholderPoints.length
+      ? [
+          {
+            id: "financial-chart-shareholders",
+            title: "股东人数趋势",
+            points: shareholderPoints,
+            yAxes: [
+              {
+                type: "value",
+                name: "户数",
+                axisLabel: { formatter: countAxisFormatter },
+                splitLine: { lineStyle: { color: "#edf1f7" } }
+              }
+            ],
+            series: [
+              financialSeries(payload, shareholderPoints, "shareholderCount", {
+                type: "line",
+                color: "#dc2626"
+              })
+            ]
+          }
+        ]
+      : []),
     {
       id: "financial-chart-income",
       title: "营收与利润（季度）",
@@ -1388,7 +1549,9 @@ function renderFinancialCharts(payload, points) {
       series: [financialSeries(payload, points, "debtAssetRatio", { type: "line", color: "#475467" })]
     }
   ];
-  $("#financial-charts").innerHTML = chartDefs.map((chart) => chartContainer(chart.title, chart.id)).join("");
+  $("#financial-charts").innerHTML = chartDefs
+    .map((chart) => chartContainer(chart.title, chart.id, chart.wide))
+    .join("");
   if (!window.echarts) {
     $("#financial-charts").innerHTML = '<div class="empty-cell">ECharts 加载失败，无法绘制图表。</div>';
     return;
@@ -1397,14 +1560,22 @@ function renderFinancialCharts(payload, points) {
     const element = document.getElementById(definition.id);
     if (!element) return;
     const chart = window.echarts.init(element, null, { renderer: "canvas" });
-    chart.setOption(baseFinancialChartOption(definition.title, payload, points, definition.yAxes, definition.series));
+    chart.setOption(
+      baseFinancialChartOption(
+        definition.title,
+        payload,
+        definition.points || points,
+        definition.yAxes,
+        definition.series
+      )
+    );
     state.financialCharts.push(chart);
   });
 }
 
 function renderFinancialTable(payload, points) {
   const metricMap = financialMetricMap(payload);
-  const columns = ["revenue", "netIncome", "operatingCashFlow", "contractLiabilities", "accountsReceivable", "inventory", "debtAssetRatio"];
+  const columns = ["marketCap", "revenue", "netIncome", "operatingCashFlow", "contractLiabilities", "accountsReceivable", "inventory", "debtAssetRatio"];
   return `<section class="table-panel financial-table-panel">
     <div class="table-scroll">
       <table class="ranking-table">
@@ -1491,6 +1662,7 @@ function renderEvidenceCoverage(evidencePackage) {
             <span class="${evidenceStatusClass(item.status)}">${escapeHtml(evidenceStatusLabel(item.status))}</span>
             ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">来源</a>` : ""}
             ${item.excerptCount ? `<small>${escapeHtml(`摘录 ${item.excerptCount} 条`)}</small>` : ""}
+            ${item.riskExcerptCount ? `<small>${escapeHtml(`风险摘录 ${item.riskExcerptCount} 条`)}</small>` : ""}
             ${item.reason ? `<p>${escapeHtml(item.reason)}</p>` : ""}
           </div>`
         )

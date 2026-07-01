@@ -545,7 +545,7 @@ input {
 
 .ranking-table {
   width: 100%;
-  min-width: 1280px;
+  min-width: 1640px;
   border-collapse: collapse;
 }
 
@@ -625,6 +625,54 @@ input {
   gap: 8px;
   min-width: 160px;
   font-weight: 780;
+}
+
+.reaction-cell {
+  display: grid;
+  gap: 4px;
+  min-width: 138px;
+  color: var(--slate);
+}
+
+.reaction-cell strong {
+  width: fit-content;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #eef2f6;
+  color: var(--slate);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.reaction-cell small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.preview-cell {
+  min-width: 164px;
+}
+
+.reaction-cell.good strong {
+  background: #e9f8ef;
+  color: #087443;
+}
+
+.reaction-cell.bad strong {
+  background: #fff1f0;
+  color: #b42318;
+}
+
+.reaction-cell.neutral strong {
+  background: #eef4ff;
+  color: #175cd3;
+}
+
+.reaction-cell.pending strong,
+.reaction-cell.missing strong {
+  background: #f2f4f7;
+  color: #667085;
 }
 
 .hot-badge,
@@ -1071,6 +1119,10 @@ body[data-market="cn"] .ticker-stack em {
   background: var(--panel);
 }
 
+.chart-card.is-wide {
+  grid-column: 1 / -1;
+}
+
 .chart-heading {
   display: flex;
   align-items: flex-start;
@@ -1132,6 +1184,10 @@ body[data-market="cn"] .ticker-stack em {
 .chart-container {
   width: 100%;
   min-height: 380px;
+}
+
+.chart-card.is-wide .chart-container {
+  min-height: 420px;
 }
 
 .financial-tooltip {

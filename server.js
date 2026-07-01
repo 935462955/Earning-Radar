@@ -36,10 +36,10 @@ const NET_INCOME_TURNAROUND_MIN_VALUE = Number(process.env.NET_INCOME_TURNAROUND
 const NET_INCOME_TURNAROUND_MIN_MARGIN = Number(process.env.NET_INCOME_TURNAROUND_MIN_MARGIN || 0.03);
 const WEB_CONTEXT_RESULTS_LIMIT = Number(process.env.WEB_CONTEXT_RESULTS_LIMIT || 6);
 const ENRICH_LIMIT = Number(process.env.ENRICH_LIMIT || 100);
-const RANKING_DIAGNOSTICS_VERSION = 18;
-const RELEASE_CANDIDATE_CACHE_VERSION = 2;
+const RANKING_DIAGNOSTICS_VERSION = 22;
+const RELEASE_CANDIDATE_CACHE_VERSION = 3;
 const SIGNAL_PATTERN_VERSION = 5;
-const ASHARE_DATA_FILTER_VERSION = 3;
+const ASHARE_DATA_FILTER_VERSION = 5;
 const ASHARE_CALENDAR_VERSION = 3;
 const OPENAI_SETTINGS = AI_CONFIG.openai || {};
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || OPENAI_SETTINGS.apiKey || "";
@@ -515,8 +515,10 @@ function flattenWebSearchResults(searches = []) {
   };
 }
 
-async function cachedPdfText(url, force = false, ttl = TEXT_TTL) {
-  const name = `pdf-text-${hashKey(url)}.json`;
+async function cachedPdfText(url, force = false, ttl = TEXT_TTL, options = {}) {
+  const first = clampNumber(options.first, 1, 1, 500);
+  const last = clampNumber(options.last, 45, first, 500);
+  const name = `pdf-text-${hashKey(`${url}:${first}:${last}`)}.json`;
   if (!force) {
     const cached = await readCache(name, ttl);
     if (cached?.text) return cached.text;
@@ -531,11 +533,13 @@ async function cachedPdfText(url, force = false, ttl = TEXT_TTL) {
   const data = new Uint8Array(await response.arrayBuffer());
   const parser = new PDFParse({ data });
   try {
-    const result = await parser.getText({ first: 1, last: 45 });
+    const result = await parser.getText({ first, last });
     const text = normalizeSignalText(result.text || "");
     await writeCache(name, {
       text,
       url,
+      first,
+      last,
       pages: result.total || null,
       fetchedAt: new Date().toISOString()
     });
@@ -1456,11 +1460,11 @@ function rowNumberTokenToValue(token, scale = 1) {
   return (negative ? -number : number) * scale;
 }
 
-function numericValuesFromRow(rowText) {
+function numericValuesFromCellText(cellText) {
   const values = [];
   const pattern = /\(?\$?\d[\d,]*(?:\.\d+)?\)?/g;
   let match;
-  while ((match = pattern.exec(rowText)) && values.length < 12) {
+  while ((match = pattern.exec(cellText)) && values.length < 12) {
     const value = rowNumberTokenToValue(match[0]);
     if (value == null) continue;
     values.push(value);
@@ -1468,15 +1472,35 @@ function numericValuesFromRow(rowText) {
   return values;
 }
 
+function numericValuesFromCells(cells = []) {
+  const labelIndex = cells.findIndex((cell) => /[A-Za-z]/.test(cell));
+  const valueCells = cells.slice(labelIndex >= 0 ? labelIndex + 1 : 0);
+  return valueCells.flatMap(numericValuesFromCellText).slice(0, 12);
+}
+
+function numericValuesFromRow(row) {
+  if (Array.isArray(row?.cells) && row.cells.length > 1) {
+    return numericValuesFromCells(row.cells);
+  }
+  return numericValuesFromCellText(typeof row === "string" ? row : row?.text || "");
+}
+
 function htmlTableRows(html) {
   return [...String(html || "").matchAll(/<tr[\s\S]*?<\/tr>/gi)]
-    .map((match) => textFromHtmlFragment(match[0]))
-    .map((row) => row.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
+    .map((match) => {
+      const cells = [...match[0].matchAll(/<t[dh]\b[\s\S]*?<\/t[dh]>/gi)]
+        .map((cell) => textFromHtmlFragment(cell[0]).replace(/\s+/g, " ").trim())
+        .filter(Boolean);
+      const text = (cells.length ? cells.join(" ") : textFromHtmlFragment(match[0]))
+        .replace(/\s+/g, " ")
+        .trim();
+      return { text, cells };
+    })
+    .filter((row) => row.text);
 }
 
 function findFinancialRow(rows, labelPattern) {
-  return rows.find((row) => labelPattern.test(row)) || "";
+  return rows.find((row) => labelPattern.test(row.text || row)) || "";
 }
 
 function releaseFact(value, filing, reportDate, concept) {
@@ -2013,10 +2037,13 @@ async function resolveCandidateFiling(candidate, range, force, diagnostics) {
   const submissionsUrl = `https://data.sec.gov/submissions/CIK${cikPad(candidate.cik)}.json`;
   const submissions = await cachedSecJson(submissionsUrl, force);
   const filings = zipFilings(submissions.filings?.recent);
-  const filing =
+  let filing =
     candidate.filing?.accessionNumber && inDateRange(candidate.filing.filingDate, range.start, range.today)
       ? candidate.filing
       : findFilingForAccessions(filings, candidate.accessions, range);
+  if (!filing && candidate.forced) {
+    filing = latestFilingByForms(filings, ["10-Q", "10-K", "20-F", "40-F"]);
+  }
   if (!filing && diagnostics) {
     diagnostics.filingMissing.push({
       ...candidateSummary(candidate, "SEC submissions 中没有匹配当前披露窗口的 10-Q/10-K/20-F/40-F"),
@@ -2180,6 +2207,7 @@ async function enrichFrameCandidate(candidate, range, force, diagnostics, option
 
   const fallbackEnd =
     candidate.rawMetrics.revenue.current?.end || candidate.rawMetrics.netIncome.current?.end || "";
+  const fallbackFact = latestMetricFact(candidate.rawMetrics);
 
   return {
     symbol: candidate.symbol,
@@ -2209,12 +2237,12 @@ async function enrichFrameCandidate(candidate, range, force, diagnostics, option
           url: secFilingUrl(candidate.cik, filing.accessionNumber, filing.primaryDocument)
         }
       : {
-          form: "SEC frame",
-          filingDate: "",
+          form: fallbackFact?.form || "SEC frame",
+          filingDate: fallbackFact?.filed || "",
           reportDate: fallbackEnd,
-          accessionNumber: candidate.accessions[0] || "",
+          accessionNumber: candidate.accessions[0] || fallbackFact?.accn || "",
           primaryDocument: "",
-          url: `https://www.sec.gov/edgar/browse/?CIK=${candidate.symbol}&owner=exclude`
+          url: `https://www.sec.gov/edgar/browse/?CIK=${candidate.cik}&owner=exclude`
         },
     stockUrl: stockUrl(candidate.symbol),
     stockLinks: usStockLinks(candidate.symbol),
@@ -2304,6 +2332,72 @@ function metricFromFinancialPoints(points, key, concept = key) {
   return { concept, current, prior, growth: growth(current, prior) };
 }
 
+function emptyMetric(concept = "") {
+  return { concept, current: null, prior: null, growth: { pct: null, turnaround: false } };
+}
+
+function rawMetricsFromFinancialPoints(points) {
+  const revenue = metricFromFinancialPoints(points, "revenue", "revenue");
+  const netIncome = metricFromFinancialPoints(points, "netIncome", "netIncome");
+  const grossProfit = metricFromFinancialPoints(points, "grossProfit", "grossProfit");
+  const operatingIncome = metricFromFinancialPoints(points, "operatingProfit", "operatingProfit");
+  const operatingCashFlow = metricFromFinancialPoints(points, "operatingCashFlow", "operatingCashFlow");
+  const grossMargin = margin(grossProfit.current, revenue.current);
+  const grossMarginPrior = margin(grossProfit.prior, revenue.prior);
+  const operatingMargin = margin(operatingIncome.current, revenue.current);
+  const operatingMarginPrior = margin(operatingIncome.prior, revenue.prior);
+  return {
+    revenue,
+    netIncome,
+    grossProfit,
+    operatingIncome,
+    operatingCashFlow,
+    epsDiluted: emptyMetric("epsDiluted"),
+    grossMargin,
+    grossMarginPrior,
+    grossMarginDelta:
+      grossMargin != null && grossMarginPrior != null ? grossMargin - grossMarginPrior : null,
+    operatingMargin,
+    operatingMarginPrior,
+    operatingMarginDelta:
+      operatingMargin != null && operatingMarginPrior != null
+        ? operatingMargin - operatingMarginPrior
+        : null
+  };
+}
+
+function hasCurrentStructuredFacts(rawMetrics, options = {}) {
+  return Boolean(
+    rawMetrics?.revenue?.current ||
+      rawMetrics?.netIncome?.current ||
+      (options.includeCashFlow && rawMetrics?.operatingCashFlow?.current)
+  );
+}
+
+async function buildCompanyfactsCandidate(universeItem, company, force, options) {
+  const symbol = normalizeTicker(universeItem.symbol || company.ticker || "");
+  const financials = await getUsFinancials(symbol, force, { includeMarketCap: false });
+  const points = sortFinancialPoints(financials.quarterly?.length ? financials.quarterly : financials.annual || []);
+  const rawMetrics = rawMetricsFromFinancialPoints(points);
+  if (!hasCurrentStructuredFacts(rawMetrics, options) && !universeItem?.forced) return null;
+  const metricScore = scoreMetrics(rawMetrics, options);
+  if (metricScore.score <= 0 && !universeItem?.forced) return null;
+  return {
+    symbol,
+    company,
+    cik: company.cik,
+    sources: sourceSet(...(universeItem.sources || []), "companyfacts"),
+    calendarDates: universeItem.calendarDates || [],
+    forced: universeItem.forced || false,
+    manualQueries: universeItem.manualQueries || [],
+    rawMetrics,
+    metricScore,
+    accessions: [],
+    submissionsName: financials.name || company.name,
+    structuredSource: "SEC companyfacts JSON"
+  };
+}
+
 function focusedMetricScore(rawMetrics, options) {
   const score = scoreMetrics(rawMetrics, options);
   if (score.reasons.length) return score;
@@ -2313,6 +2407,39 @@ function focusedMetricScore(rawMetrics, options) {
 async function focusedUsRankingRow(company, options, force = false, diagnostics = null) {
   const symbol = normalizeTicker(company.ticker);
   const range = quarterRange();
+  let structuredCandidate = null;
+  let structuredError = null;
+  try {
+    structuredCandidate = await buildCompanyfactsCandidate(
+      {
+        symbol,
+        sources: ["manual"],
+        calendarDates: [],
+        forced: true,
+        manualQueries: company.queries || []
+      },
+      company,
+      force,
+      options
+    );
+    if (structuredCandidate && hasCurrentStructuredFacts(structuredCandidate.rawMetrics, options)) {
+      const resolved = await resolveCandidateFiling(structuredCandidate, range, force, diagnostics);
+      return {
+        ...(await enrichFrameCandidate(resolved, range, force, diagnostics, options)),
+        analysisCache: "focused-companyfacts"
+      };
+    }
+  } catch (error) {
+    structuredError = error;
+    if (diagnostics) {
+      diagnostics.enrichFailures.push({
+        symbol,
+        name: company.name || symbol,
+        reason: "指定公司读取 SEC companyfacts JSON 失败，尝试回退到 8-K/6-K earnings release",
+        error: error.message
+      });
+    }
+  }
   try {
     const releaseCandidate = await buildEarningsReleaseCandidate(
       {
@@ -2330,7 +2457,7 @@ async function focusedUsRankingRow(company, options, force = false, diagnostics 
     if (releaseCandidate) {
       return {
         ...(await enrichFrameCandidate(releaseCandidate, range, force, diagnostics, options)),
-        analysisCache: "focused-release"
+        analysisCache: "focused-release-fallback"
       };
     }
   } catch (error) {
@@ -2338,34 +2465,15 @@ async function focusedUsRankingRow(company, options, force = false, diagnostics 
       diagnostics.enrichFailures.push({
         symbol,
         name: company.name || symbol,
-        reason: "指定公司扫描 8-K/6-K earnings release 失败，已回退到 SEC companyfacts",
+        reason: "指定公司 companyfacts JSON 缺少当前期核心指标后，扫描 8-K/6-K earnings release 失败",
         error: error.message
       });
     }
   }
-  const financials = await getUsFinancials(symbol, force);
-  const points = sortFinancialPoints(financials.quarterly?.length ? financials.quarterly : financials.annual || []);
-  const revenue = metricFromFinancialPoints(points, "revenue", "revenue");
-  const netIncome = metricFromFinancialPoints(points, "netIncome", "netIncome");
-  const operatingIncome = metricFromFinancialPoints(points, "operatingProfit", "operatingProfit");
-  const operatingCashFlow = metricFromFinancialPoints(points, "operatingCashFlow", "operatingCashFlow");
-  const rawMetrics = {
-    revenue,
-    netIncome,
-    grossProfit: { concept: "grossProfit", current: null, prior: null, growth: { pct: null, turnaround: false } },
-    operatingIncome,
-    operatingCashFlow,
-    epsDiluted: { concept: "epsDiluted", current: null, prior: null, growth: { pct: null, turnaround: false } },
-    grossMargin: null,
-    grossMarginPrior: null,
-    grossMarginDelta: null,
-    operatingMargin: margin(operatingIncome.current, revenue.current),
-    operatingMarginPrior: margin(operatingIncome.prior, revenue.prior)
-  };
-  rawMetrics.operatingMarginDelta =
-    rawMetrics.operatingMargin != null && rawMetrics.operatingMarginPrior != null
-      ? rawMetrics.operatingMargin - rawMetrics.operatingMarginPrior
-      : null;
+  if (!structuredCandidate) {
+    throw structuredError || new Error("SEC companyfacts JSON 和 earnings release 都没有可用数据");
+  }
+  const rawMetrics = structuredCandidate.rawMetrics;
   const metricScore = focusedMetricScore(rawMetrics, options);
   const submissionsUrl = `https://data.sec.gov/submissions/CIK${cikPad(company.cik)}.json`;
   const submissions = await cachedSecJson(submissionsUrl, force, PROFILE_TTL);
@@ -2384,10 +2492,11 @@ async function focusedUsRankingRow(company, options, force = false, diagnostics 
     signals.some((signal) =>
       ["产品供不应求", "供给偏紧", "需求旺盛", "产品价格中枢持续上涨"].includes(signal.label)
     );
-  const fallbackEnd = revenue.current?.end || netIncome.current?.end || "";
+  const fallbackEnd = rawMetrics.revenue.current?.end || rawMetrics.netIncome.current?.end || "";
+  const fallbackFact = latestMetricFact(rawMetrics);
   return {
     symbol,
-    name: financials.name || company.name || symbol,
+    name: structuredCandidate.submissionsName || company.name || symbol,
     exchange: company.exchange || "",
     score: Math.min(100, Math.max(0, score)),
     highlight,
@@ -2406,26 +2515,26 @@ async function focusedUsRankingRow(company, options, force = false, diagnostics 
           url: secFilingUrl(company.cik, filing.accessionNumber, filing.primaryDocument)
         }
       : {
-          form: "SEC companyfacts",
-          filingDate: "",
+          form: fallbackFact?.form || "SEC companyfacts",
+          filingDate: fallbackFact?.filed || "",
           reportDate: fallbackEnd,
-          accessionNumber: "",
+          accessionNumber: fallbackFact?.accn || "",
           primaryDocument: "",
           url: `https://www.sec.gov/edgar/browse/?CIK=${company.cik}&owner=exclude`
         },
     stockUrl: stockUrl(symbol),
     stockLinks: usStockLinks(symbol),
     metrics: {
-      revenue: metricPayload(revenue),
-      netIncome: metricPayload(netIncome),
+      revenue: metricPayload(rawMetrics.revenue),
+      netIncome: metricPayload(rawMetrics.netIncome),
       epsDiluted: metricPayload(rawMetrics.epsDiluted),
-      operatingCashFlow: metricPayload(operatingCashFlow),
-      grossMargin: null,
-      grossMarginDelta: null,
+      operatingCashFlow: metricPayload(rawMetrics.operatingCashFlow),
+      grossMargin: rawMetrics.grossMargin,
+      grossMarginDelta: rawMetrics.grossMarginDelta,
       operatingMargin: rawMetrics.operatingMargin,
       operatingMarginDelta: rawMetrics.operatingMarginDelta
     },
-    analysisCache: "focused"
+    analysisCache: "focused-companyfacts-partial"
   };
 }
 
@@ -2460,6 +2569,7 @@ async function getFocusedUsRankings(force = false, options = parseRankingOptions
         `未来 ${NEXT_EARNINGS_LOOKAHEAD_DAYS} 天 Nasdaq 日历未找到下一次财报日期`
       );
   }
+  await attachAnnouncementReactions(rows, "us", force, progress);
   const failures = rowsRaw
     .filter((row) => row?.error)
     .map((row) => ({
@@ -2478,7 +2588,7 @@ async function getFocusedUsRankings(force = false, options = parseRankingOptions
     analysisOptions: {
       analysisLimit: options.analysisLimit,
       reuseAnalysis: options.reuseAnalysis,
-      method: "指定公司快速分析：8-K/6-K earnings-release fallback + SEC companyfacts + submissions",
+      method: "指定公司快速分析：SEC companyfacts JSON 优先；仅缺核心指标时回退 8-K/6-K earnings-release",
       usesLLM: false,
       includeCashFlow: options.includeCashFlow,
       cashFlowThresholdPct: options.cashFlowThresholdPct,
@@ -2486,10 +2596,11 @@ async function getFocusedUsRankings(force = false, options = parseRankingOptions
       focusCompanyQueries: options.focusCompanyQueries
     },
     source: {
-      filings: "SEC 8-K/6-K earnings-release exhibits + companyfacts + submissions",
+      filings: "SEC companyfacts JSON + submissions; 8-K/6-K earnings-release only as numeric fallback",
       text: "指定公司快速路径扫描匹配公司的 SEC 主文档文本",
       universe: "manual focus companies",
-      nextEarnings: "Nasdaq earnings calendar"
+      nextEarnings: "Nasdaq earnings calendar",
+      priceReaction: "Nasdaq historical daily close"
     },
     nextEarningsStats: nextEarnings.stats,
     totals: {
@@ -2598,6 +2709,7 @@ async function getRankings(force = false, options = parseRankingOptions(), progr
   }));
 
   const candidates = [];
+  const symbolsWithCurrentJsonFacts = new Set();
   let scannedForScore = 0;
   for (const symbol of symbols) {
     scannedForScore += 1;
@@ -2612,10 +2724,8 @@ async function getRankings(force = false, options = parseRankingOptions(), progr
     const universeItem = universeMap.get(symbol);
     const forced = universeItem?.forced || false;
     const rawMetrics = metricsFromFrames(frameMaps, company.cik);
-    const hasCurrentFacts =
-      rawMetrics.revenue.current ||
-      rawMetrics.netIncome.current ||
-      (options.includeCashFlow && rawMetrics.operatingCashFlow.current);
+    const hasCurrentFacts = hasCurrentStructuredFacts(rawMetrics, options);
+    if (hasCurrentFacts) symbolsWithCurrentJsonFacts.add(symbol);
     if (!hasCurrentFacts) {
       diagnostics.noCurrentFrameFacts.push({
         symbol,
@@ -2665,14 +2775,81 @@ async function getRankings(force = false, options = parseRankingOptions(), progr
   const releaseFallbackStart = toDateOnly(
     addDays(parseDate(range.today) || new Date(), -EARNINGS_RELEASE_LOOKBACK_DAYS)
   );
-  const releaseUniverseItems = universeItems.filter(
+  const structuredFallbackUniverseItems = universeItems.filter(
     (item) =>
       tickerMap.has(item.symbol) &&
+      !symbolsWithCurrentJsonFacts.has(item.symbol) &&
       (item.forced ||
         item.sources.includes("static") ||
         (item.sources.includes("calendar") && latestDate(item.calendarDates) >= releaseFallbackStart))
   );
-  emitProgress(progress, "earnings-release", `扫描最近 ${EARNINGS_RELEASE_LOOKBACK_DAYS} 天 8-K/6-K 业绩新闻稿：${releaseUniverseItems.length} 家`, {
+  emitProgress(progress, "companyfacts", `SEC frames 缺口改用 companyfacts JSON 补齐：${structuredFallbackUniverseItems.length} 家`, {
+    candidates: structuredFallbackUniverseItems.length,
+    since: releaseFallbackStart
+  });
+  let companyfactsScanned = 0;
+  let companyfactsMatched = 0;
+  let companyfactsFailed = 0;
+  const companyfactsCandidatesRaw = await mapLimit(structuredFallbackUniverseItems, 4, async (item) => {
+    const company = tickerMap.get(item.symbol);
+    try {
+      const candidate = await buildCompanyfactsCandidate(item, company, force, options);
+      if (candidate) companyfactsMatched += 1;
+      return candidate;
+    } catch (error) {
+      companyfactsFailed += 1;
+      return { error: error.message, item };
+    } finally {
+      companyfactsScanned += 1;
+      if (
+        companyfactsScanned === 1 ||
+        companyfactsScanned % 20 === 0 ||
+        companyfactsScanned === structuredFallbackUniverseItems.length
+      ) {
+        emitProgress(
+          progress,
+          "companyfacts",
+          `SEC companyfacts JSON 补齐 ${companyfactsScanned}/${structuredFallbackUniverseItems.length} 家`,
+          {
+            scanned: companyfactsScanned,
+            total: structuredFallbackUniverseItems.length,
+            matched: companyfactsMatched,
+            failed: companyfactsFailed,
+            since: releaseFallbackStart
+          }
+        );
+      }
+    }
+  });
+  const companyfactsErrors = companyfactsCandidatesRaw
+    .filter((row) => row?.error)
+    .map((row) => ({
+      symbol: row.item?.symbol || "",
+      name: row.item?.calendarName || row.item?.symbol || "",
+      sources: row.item?.sources || [],
+      calendarDates: row.item?.calendarDates || [],
+      reason: "读取 SEC companyfacts JSON 失败",
+      error: row.error
+    }));
+  diagnostics.enrichFailures.push(...companyfactsErrors);
+  const companyfactsCandidates = companyfactsCandidatesRaw.filter((row) => row && !row.error);
+  if (companyfactsCandidates.length) {
+    const companyfactsSymbolsWithFacts = new Set(
+      companyfactsCandidates
+        .filter((candidate) => hasCurrentStructuredFacts(candidate.rawMetrics, options))
+        .map((candidate) => candidate.symbol)
+    );
+    for (const symbol of companyfactsSymbolsWithFacts) symbolsWithCurrentJsonFacts.add(symbol);
+    diagnostics.noCurrentFrameFacts = diagnostics.noCurrentFrameFacts.filter(
+      (item) => !companyfactsSymbolsWithFacts.has(item.symbol)
+    );
+    candidates.push(...companyfactsCandidates);
+  }
+
+  const releaseUniverseItems = structuredFallbackUniverseItems.filter(
+    (item) => !symbolsWithCurrentJsonFacts.has(item.symbol)
+  );
+  emitProgress(progress, "earnings-release", `companyfacts 仍缺核心指标，扫描 8-K/6-K 业绩新闻稿：${releaseUniverseItems.length} 家`, {
     candidates: releaseUniverseItems.length,
     since: releaseFallbackStart
   });
@@ -2829,6 +3006,7 @@ async function getRankings(force = false, options = parseRankingOptions(), progr
         `未来 ${NEXT_EARNINGS_LOOKAHEAD_DAYS} 天 Nasdaq 日历未找到下一次财报日期`
       );
   }
+  await attachAnnouncementReactions(ranked, "us", force, progress);
   diagnostics.noPositiveScore = sortDiagnosticsByFilingDate(diagnostics.noPositiveScore);
   emitProgress(progress, "diagnostics", "整理覆盖与异常列表");
   diagnostics.counts = diagnosticsCounts(diagnostics);
@@ -2842,7 +3020,7 @@ async function getRankings(force = false, options = parseRankingOptions(), progr
       analysisLimit: options.analysisLimit,
       reuseAnalysis: options.reuseAnalysis,
       order: "calendarDateThenFilingDateDesc",
-      method: `SEC XBRL frames + recent ${EARNINGS_RELEASE_LOOKBACK_DAYS}d 8-K/6-K earnings-release fallback + regex keyword scan`,
+      method: `SEC XBRL frames + SEC companyfacts JSON fallback + recent ${EARNINGS_RELEASE_LOOKBACK_DAYS}d 8-K/6-K earnings-release last resort + regex keyword scan`,
       usesLLM: false,
       includeCashFlow: options.includeCashFlow,
       cashFlowThresholdPct: options.cashFlowThresholdPct,
@@ -2850,10 +3028,11 @@ async function getRankings(force = false, options = parseRankingOptions(), progr
       focusCompanyQueries: options.focusCompanyQueries
     },
     source: {
-      filings: "SEC EDGAR frames + submissions + 8-K/6-K earnings-release exhibits",
+      filings: "SEC EDGAR frames + companyfacts JSON + submissions; 8-K/6-K earnings-release exhibits only as numeric fallback",
       text: "SEC filing primary documents; regex/string keyword matching, no LLM",
       universe: "config/universe.json + Nasdaq earnings calendar for the current disclosure window",
-      nextEarnings: "Nasdaq earnings calendar"
+      nextEarnings: "Nasdaq earnings calendar",
+      priceReaction: "Nasdaq historical daily close"
     },
     nextEarningsStats: nextEarnings.stats,
     totals: {
@@ -3165,6 +3344,8 @@ async function getCompanyProfiles(symbols, force = false) {
 }
 
 const FINANCIAL_METRICS = [
+  { key: "marketCap", label: "市值", kind: "market", unit: "money" },
+  { key: "shareholderCount", label: "股东人数", kind: "holder", unit: "count" },
   { key: "revenue", label: "营收", kind: "flow", unit: "money" },
   { key: "netIncome", label: "归母净利润", kind: "flow", unit: "money" },
   { key: "operatingCashFlow", label: "经营现金流", kind: "flow", unit: "money" },
@@ -3178,8 +3359,18 @@ const FINANCIAL_METRICS = [
 ];
 
 function finiteOrNull(value) {
+  if (value == null) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
+}
+
+function firstFiniteOrNull(...values) {
+  for (const value of values) {
+    const number = finiteOrNull(value);
+    if (number != null) return number;
+  }
+  return null;
 }
 
 function yearFromReportDate(value) {
@@ -3242,7 +3433,12 @@ function normalizeAshareFinancialPoint(row) {
     accountsReceivable: finiteOrNull(row.ACCOUNTS_RECE),
     inventory: finiteOrNull(row.INVENTORY),
     accountsPayable: finiteOrNull(row.ACCOUNTS_PAYABLE),
-    contractLiabilities: finiteOrNull(row.ADVANCE_RECEIVABLES),
+    contractLiabilities: firstFiniteOrNull(
+      row.CONTRACT_LIAB,
+      row.CONTRACT_LIABILITY,
+      row.CONTRACT_LIABILITIES,
+      row.ADVANCE_RECEIVABLES
+    ),
     debtAssetRatio: pctFromEastmoney(row.DEBT_ASSET_RATIO),
     currentRatio: pctFromEastmoney(row.CURRENT_RATIO)
   };
@@ -3295,22 +3491,177 @@ async function fetchAshareFinancialStatementRows(reportName, code, force = false
   );
 }
 
+function eastmoneyHsf10StockCode(secucode) {
+  const code = String(secucode || "").replace(/\D/g, "").slice(0, 6);
+  if (!code) return "";
+  if (String(secucode).endsWith(".SH")) return `SH${code}`;
+  if (String(secucode).endsWith(".BJ")) return `BJ${code}`;
+  return `SZ${code}`;
+}
+
+function eastmoneyNewFinanceAnalysisUrl(endpoint, params = {}) {
+  const query = new URLSearchParams(params);
+  return `https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/${endpoint}?${query.toString()}`;
+}
+
+function chunkItems(items, size) {
+  const output = [];
+  for (let index = 0; index < items.length; index += size) {
+    output.push(items.slice(index, index + size));
+  }
+  return output;
+}
+
+async function fetchAshareHsf10BalanceRows(code, force = false) {
+  const secucode = ashareSecucodeFromCode(code);
+  const stockCode = eastmoneyHsf10StockCode(secucode);
+  if (!stockCode) return [];
+  for (const companyType of ["4", "3", "2", "1"]) {
+    try {
+      const dateUrl = eastmoneyNewFinanceAnalysisUrl("zcfzbDateAjaxNew", {
+        companyType,
+        reportDateType: "0",
+        code: stockCode
+      });
+      const datePayload = await cachedEastmoneyJson(dateUrl, force, SEC_TTL);
+      const dates = [
+        ...new Set((datePayload?.data || []).map((row) => ashareDate(row.REPORT_DATE)).filter(Boolean))
+      ];
+      if (!dates.length) continue;
+      const chunks = chunkItems(dates, 5);
+      const payloads = await mapLimit(chunks, 4, (dateChunk) => {
+        const url = eastmoneyNewFinanceAnalysisUrl("zcfzbAjaxNew", {
+          companyType,
+          reportDateType: "0",
+          reportType: "1",
+          dates: dateChunk.join(","),
+          code: stockCode
+        });
+        return cachedEastmoneyJson(url, force, SEC_TTL);
+      });
+      const rows = payloads.flatMap((payload) => payload?.data || []);
+      if (rows.length) return rows;
+    } catch {
+      continue;
+    }
+  }
+  return [];
+}
+
+async function fetchAshareMarketCapByReportDates(code, reportDates = [], force = false) {
+  const dates = [...new Set(reportDates.map(ashareDate).filter(Boolean))];
+  if (!code || !dates.length) return new Map();
+  const rows = await mapLimit(dates, 4, async (date) => {
+    const url = eastmoneyDataUrl("RPT_VALUEANALYSIS_DET", {
+      pageSize: "1",
+      sortColumns: "TRADE_DATE",
+      sortTypes: "-1",
+      columns: "SECURITY_CODE,TRADE_DATE,TOTAL_MARKET_CAP",
+      filter: `(SECURITY_CODE="${code}")(TRADE_DATE<='${date}')`
+    });
+    const payload = await cachedEastmoneyJson(url, force, SEC_TTL);
+    const item = payload?.result?.data?.[0] || {};
+    return {
+      date,
+      tradeDate: ashareDate(item.TRADE_DATE),
+      value: finiteOrNull(item.TOTAL_MARKET_CAP)
+    };
+  });
+  const output = new Map();
+  for (const row of rows) {
+    if (row?.error || !row.date) continue;
+    output.set(row.date, {
+      value: row.value,
+      tradeDate: row.tradeDate || ""
+    });
+  }
+  return output;
+}
+
+function attachMarketCapByReportDate(points, marketCapMap) {
+  return points.map((point) => {
+    const marketCap = marketCapMap.get(point.date) || {};
+    return {
+      ...point,
+      marketCap: marketCap.value ?? null,
+      marketCapTradeDate: marketCap.tradeDate || ""
+    };
+  });
+}
+
+async function fetchAshareLatestMarketCap(code, force = false) {
+  const quoteMap = await fetchAshareQuotes([code], force);
+  const quote = quoteMap.get(code) || {};
+  return {
+    value: Number.isFinite(Number(quote.marketCap)) ? Number(quote.marketCap) : null,
+    tradeDate: quote.tradeDate || "",
+    source: "东方财富 RPT_VALUEANALYSIS_DET 最新交易日总市值"
+  };
+}
+
+async function fetchAshareShareholderTrend(code, force = false) {
+  const rows = await fetchEastmoneyPaged(
+    "RPT_HOLDERNUM_DET",
+    {
+      pageSize: "200",
+      sortColumns: "END_DATE",
+      sortTypes: "-1",
+      filter: `(SECURITY_CODE="${code}")`
+    },
+    force
+  );
+  const byDate = new Map();
+  for (const row of rows) {
+    const date = ashareDate(row.END_DATE);
+    const shareholderCount = finiteOrNull(row.HOLDER_NUM);
+    if (!date || shareholderCount == null) continue;
+    const normalized = {
+      date,
+      periodLabel: date,
+      shareholderCount,
+      previousShareholderCount: finiteOrNull(row.PRE_HOLDER_NUM),
+      shareholderCountChange: finiteOrNull(row.HOLDER_NUM_CHANGE),
+      shareholderCountChangeRatio: pctFromEastmoney(row.HOLDER_NUM_RATIO),
+      noticeDate: ashareDate(row.HOLD_NOTICE_DATE),
+      avgMarketCapPerHolder: finiteOrNull(row.AVG_MARKET_CAP),
+      avgHoldShares: finiteOrNull(row.AVG_HOLD_NUM),
+      totalShares: finiteOrNull(row.TOTAL_A_SHARES),
+      closePrice: finiteOrNull(row.CLOSE_PRICE),
+      source: "东方财富 RPT_HOLDERNUM_DET"
+    };
+    const existing = byDate.get(date);
+    if (!existing || String(normalized.noticeDate || "").localeCompare(String(existing.noticeDate || "")) > 0) {
+      byDate.set(date, normalized);
+    }
+  }
+  return [...byDate.values()].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+}
+
 async function getAshareFinancials(symbol, force = false) {
   const code = String(symbol || "").replace(/\D/g, "").slice(0, 6);
   if (!code) throw new Error("缺少 A股代码");
-  const cacheName = `ashare-financials-v2-${code}.json`;
+  const cacheName = `ashare-financials-v6-${code}.json`;
   if (!force) {
     const cached = await readCache(cacheName, SEC_TTL);
     if (cached) return { ...cached, cache: "hit" };
   }
 
-  const [incomeRows, cashRows, balanceRows] = await Promise.all([
+  const [incomeRows, cashRows, hsf10BalanceRows, balanceRows, shareholderTrend] = await Promise.all([
     fetchAshareFinancialStatementRows("RPT_DMSK_FN_INCOME", code, force),
     fetchAshareFinancialStatementRows("RPT_DMSK_FN_CASHFLOW", code, force),
-    fetchAshareFinancialStatementRows("RPT_DMSK_FN_BALANCE", code, force)
+    fetchAshareHsf10BalanceRows(code, force),
+    fetchAshareFinancialStatementRows("RPT_DMSK_FN_BALANCE", code, force),
+    fetchAshareShareholderTrend(code, force)
   ]);
-  const merged = mergeFinancialRows(incomeRows, cashRows, balanceRows);
-  const points = merged.map(normalizeAshareFinancialPoint).filter((point) => point.year);
+  const merged = mergeFinancialRows(incomeRows, cashRows, hsf10BalanceRows, balanceRows);
+  const normalizedPoints = merged.map(normalizeAshareFinancialPoint).filter((point) => point.year);
+  const marketCapMap = await fetchAshareMarketCapByReportDates(
+    code,
+    normalizedPoints.map((point) => point.date),
+    force
+  );
+  const latestMarketCap = await fetchAshareLatestMarketCap(code, force);
+  const points = attachMarketCapByReportDate(normalizedPoints, marketCapMap);
   const quarterly = deriveAshareSingleQuarterPoints(points);
   const annual = points.filter((point) => String(point.date).endsWith("-12-31"));
   const sourceRow = incomeRows[0] || cashRows[0] || balanceRows[0] || {};
@@ -3319,17 +3670,21 @@ async function getAshareFinancials(symbol, force = false) {
     symbol: code,
     name: sourceRow.SECURITY_NAME_ABBR || code,
     generatedAt: new Date().toISOString(),
-    source: "东方财富三大财务报表 RPT_DMSK_FN_INCOME/CASHFLOW/BALANCE",
+    source: "东方财富三大财务报表 RPT_DMSK_FN_INCOME/CASHFLOW/BALANCE + HSF10 明细资产负债表",
     currency: "CNY",
     unitDivisor: 100000000,
     unitLabel: "亿元",
     metrics: FINANCIAL_METRICS,
     accuracyNotes: [
       "A股利润表和现金流量表的季报原始值通常是年初至报告期末累计口径；页面展示的季度流量按同一年相邻报告期差额拆分，缺上一期时不强行估算。",
-      "资产负债表项目是报告期末时点余额，直接使用披露值；资产负债率直接使用东方财富结构化字段。"
+      "资产负债表项目是报告期末时点余额，直接使用披露值；合同负债优先使用东方财富 HSF10 明细资产负债表 CONTRACT_LIAB 字段，缺失时退回预收款项 ADVANCE_RECEIVABLES；资产负债率直接使用东方财富结构化字段。",
+      "市值使用东方财富 RPT_VALUEANALYSIS_DET 中报告期日或之前最近交易日的总市值，与财报报告期对齐展示；图表最右侧追加最新交易日市值。",
+      "股东人数来自东方财富 RPT_HOLDERNUM_DET 的 HOLDER_NUM，按 END_DATE 展示披露点趋势；同一日期多条记录取公告日更新的一条。"
     ],
     annual: annual.length ? annual : points,
     quarterly,
+    latestMarketCap,
+    shareholderTrend,
     recent: quarterly.slice(-16).reverse()
   };
   await writeCache(cacheName, payload);
@@ -3343,6 +3698,7 @@ const US_FINANCIAL_CONCEPTS = {
     "SalesRevenueNet"
   ],
   netIncome: ["NetIncomeLoss", "ProfitLoss"],
+  grossProfit: ["GrossProfit"],
   operatingProfit: ["OperatingIncomeLoss"],
   operatingCashFlow: [
     "NetCashProvidedByUsedInOperatingActivities",
@@ -3368,7 +3724,7 @@ function unitFactsForConcept(facts, concept, unit = "USD") {
 
 function pickUsAnnualFacts(facts, concepts, unit = "USD") {
   const yearly = new Map();
-  for (const concept of concepts) {
+  for (const [conceptRank, concept] of concepts.entries()) {
     const rows = unitFactsForConcept(facts, concept, unit)
       .filter((fact) => Number.isFinite(Number(fact.val)))
       .filter((fact) => ["10-K", "20-F", "40-F"].includes(fact.form))
@@ -3381,13 +3737,23 @@ function pickUsAnnualFacts(facts, concepts, unit = "USD") {
     for (const fact of rows) {
       const year = Number(String(fact.end).slice(0, 4));
       const current = yearly.get(year);
-      if (!current || String(fact.filed || "").localeCompare(String(current.filed || "")) > 0) {
+      if (
+        !current ||
+        (current.conceptRank === conceptRank &&
+          String(fact.filed || "").localeCompare(String(current.filed || "")) > 0)
+      ) {
         yearly.set(year, {
           year,
           date: fact.end,
+          start: fact.start || "",
           value: Number(fact.val),
           concept,
-          filed: fact.filed || ""
+          filed: fact.filed || "",
+          frame: fact.frame || "",
+          form: fact.form || "",
+          fy: fact.fy || "",
+          fp: fact.fp || "",
+          conceptRank
         });
       }
     }
@@ -3400,7 +3766,7 @@ function pickUsQuarterlyFacts(facts, concepts, options = {}) {
   const instant = options.instant === true;
   const quarterly = new Map();
   const framePattern = instant ? /^CY(\d{4})Q([1-4])I$/ : /^CY(\d{4})Q([1-4])$/;
-  for (const concept of concepts) {
+  for (const [conceptRank, concept] of concepts.entries()) {
     const rows = unitFactsForConcept(facts, concept, unit)
       .filter((fact) => Number.isFinite(Number(fact.val)))
       .filter((fact) => ["10-Q", "10-K", "20-F", "40-F"].includes(fact.form))
@@ -3413,20 +3779,301 @@ function pickUsQuarterlyFacts(facts, concepts, options = {}) {
       const quarter = Number(match[2]);
       const key = `${year}Q${quarter}`;
       const current = quarterly.get(key);
-      if (!current || String(fact.filed || "").localeCompare(String(current.filed || "")) > 0) {
+      if (
+        !current ||
+        (current.conceptRank === conceptRank &&
+          String(fact.filed || "").localeCompare(String(current.filed || "")) > 0)
+      ) {
         quarterly.set(key, {
           year,
           quarter,
           periodLabel: key,
           date: fact.end || `${year}-12-31`,
+          start: fact.start || "",
           value: Number(fact.val),
           concept,
-          filed: fact.filed || ""
+          filed: fact.filed || "",
+          frame: fact.frame || "",
+          form: fact.form || "",
+          fy: fact.fy || "",
+          fp: fact.fp || "",
+          conceptRank
         });
       }
     }
   }
   return quarterly;
+}
+
+function setPreferredFinancialPoint(map, key, point) {
+  const current = map.get(key);
+  if (
+    !current ||
+    point.conceptRank < current.conceptRank ||
+    (point.conceptRank === current.conceptRank &&
+      String(point.filed || "").localeCompare(String(current.filed || "")) > 0)
+  ) {
+    map.set(key, point);
+  }
+}
+
+function pickUsYtdFlowFacts(facts, concepts, unit = "USD") {
+  const ytd = new Map();
+  for (const [conceptRank, concept] of concepts.entries()) {
+    const rows = unitFactsForConcept(facts, concept, unit)
+      .filter((fact) => Number.isFinite(Number(fact.val)))
+      .filter((fact) => ["10-Q", "20-F", "40-F"].includes(fact.form))
+      .filter((fact) => fact.start && fact.end)
+      .filter((fact) => {
+        const year = String(fact.end).slice(0, 4);
+        const quarter = quarterFromReportDate(fact.end);
+        return [1, 2, 3].includes(quarter) && String(fact.start).startsWith(`${year}-01-01`);
+      });
+    for (const fact of rows) {
+      const year = Number(String(fact.end).slice(0, 4));
+      const quarter = quarterFromReportDate(fact.end);
+      const key = `${year}Q${quarter}`;
+      setPreferredFinancialPoint(ytd, key, {
+        year,
+        quarter,
+        periodLabel: key,
+        date: fact.end,
+        start: fact.start || "",
+        value: Number(fact.val),
+        concept,
+        filed: fact.filed || "",
+        frame: fact.frame || "",
+        form: fact.form || "",
+        fy: fact.fy || "",
+        fp: fact.fp || "",
+        conceptRank
+      });
+    }
+  }
+  return ytd;
+}
+
+function deriveUsQuarterlyFlowFactsFromYtd(facts, concepts, unit = "USD") {
+  const ytd = pickUsYtdFlowFacts(facts, concepts, unit);
+  const quarterly = new Map();
+  const years = [...new Set([...ytd.values()].map((point) => point.year))].sort((a, b) => a - b);
+  for (const year of years) {
+    let previous = null;
+    for (const quarter of [1, 2, 3]) {
+      const key = `${year}Q${quarter}`;
+      const current = ytd.get(key);
+      if (!current) continue;
+      if (quarter > 1 && (!previous || current.concept !== previous.concept)) {
+        previous = current;
+        continue;
+      }
+      const value = quarter === 1 ? Number(current.value) : Number(current.value) - Number(previous.value);
+      quarterly.set(key, {
+        ...current,
+        value,
+        derived: true,
+        derivation: quarter === 1 ? "YTD Q1 equals single quarter" : `YTD Q${quarter} - YTD Q${quarter - 1}`
+      });
+      previous = current;
+    }
+  }
+  return quarterly;
+}
+
+function mergeDerivedQuarterlyFacts(baseMap, derivedMap) {
+  for (const [key, point] of derivedMap.entries()) {
+    const current = baseMap.get(key);
+    if (current && Number.isFinite(Number(current.value))) continue;
+    baseMap.set(key, point);
+  }
+  return baseMap;
+}
+
+const US_Q4_DERIVED_FLOW_KEYS = [
+  "revenue",
+  "netIncome",
+  "grossProfit",
+  "operatingProfit",
+  "operatingCashFlow"
+];
+
+function canDeriveUsCalendarQ4(annualPoint, year) {
+  if (!annualPoint || !Number.isFinite(Number(annualPoint.value))) return false;
+  if (annualPoint.date !== `${year}-12-31`) return false;
+  if (annualPoint.frame && annualPoint.frame !== `CY${year}`) return false;
+  if (annualPoint.start && !String(annualPoint.start).startsWith(`${year}-01-01`)) return false;
+  return true;
+}
+
+function deriveUsQ4FlowFacts(annualMaps, quarterlyMaps) {
+  for (const key of US_Q4_DERIVED_FLOW_KEYS) {
+    const annualMap = annualMaps[key];
+    const quarterMap = quarterlyMaps[key];
+    if (!annualMap || !quarterMap) continue;
+    for (const [year, annualPoint] of annualMap.entries()) {
+      const q4Key = `${year}Q4`;
+      const existing = quarterMap.get(q4Key);
+      if (existing && Number.isFinite(Number(existing.value))) continue;
+      if (!canDeriveUsCalendarQ4(annualPoint, year)) continue;
+      const q1 = quarterMap.get(`${year}Q1`);
+      const q2 = quarterMap.get(`${year}Q2`);
+      const q3 = quarterMap.get(`${year}Q3`);
+      const quarters = [q1, q2, q3];
+      const sameConcept = quarters.every((point) => point?.concept === annualPoint.concept);
+      const hasValues = quarters.every((point) => Number.isFinite(Number(point?.value)));
+      if (!sameConcept || !hasValues) continue;
+      const value = Number(annualPoint.value) - quarters.reduce((sum, point) => sum + Number(point.value), 0);
+      quarterMap.set(q4Key, {
+        year,
+        quarter: 4,
+        periodLabel: q4Key,
+        date: annualPoint.date,
+        start: `${year}-10-01`,
+        value,
+        concept: annualPoint.concept,
+        filed: annualPoint.filed || "",
+        frame: `CY${year}Q4`,
+        form: annualPoint.form || "10-K",
+        fy: annualPoint.fy || year,
+        fp: "Q4",
+        derived: true,
+        derivation: "FY - Q1 - Q2 - Q3"
+      });
+    }
+  }
+  return quarterlyMaps;
+}
+
+function parseNasdaqMoney(value) {
+  const number = Number(String(value || "").replace(/[$,\s]/g, ""));
+  return Number.isFinite(number) ? number : null;
+}
+
+function parseNasdaqHistoricalDate(value) {
+  const match = String(value || "").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!match) return "";
+  return `${match[3]}-${match[1].padStart(2, "0")}-${match[2].padStart(2, "0")}`;
+}
+
+async function fetchNasdaqHistoricalPrices(symbol, fromDate, toDate, force = false) {
+  if (!symbol || !fromDate || !toDate) return [];
+  const safeSymbol = encodeURIComponent(usStockSymbol(symbol));
+  const url = `https://api.nasdaq.com/api/quote/${safeSymbol}/historical?assetclass=stocks&fromdate=${fromDate}&todate=${toDate}&limit=9999`;
+  try {
+    const payload = await cachedNasdaqJson(url, force, DAY);
+    return (payload?.data?.tradesTable?.rows || [])
+      .map((row) => ({
+        date: parseNasdaqHistoricalDate(row.date),
+        close: parseNasdaqMoney(row.close)
+      }))
+      .filter((row) => row.date && Number.isFinite(row.close))
+      .sort((a, b) => a.date.localeCompare(b.date));
+  } catch {
+    return [];
+  }
+}
+
+function unitFactsForAnyNamespace(facts, namespace, concept, unit = "shares") {
+  return facts?.facts?.[namespace]?.[concept]?.units?.[unit] || [];
+}
+
+function pickUsSharesOutstandingFacts(facts) {
+  const rows = [
+    ...unitFactsForAnyNamespace(facts, "dei", "EntityCommonStockSharesOutstanding", "shares"),
+    ...unitFactsForAnyNamespace(facts, "us-gaap", "CommonStockSharesOutstanding", "shares")
+  ]
+    .filter((fact) => Number.isFinite(Number(fact.val)) && fact.end)
+    .filter((fact) => ["10-Q", "10-K", "20-F", "40-F", "6-K"].includes(fact.form || ""))
+    .sort((a, b) => String(b.filed || "").localeCompare(String(a.filed || "")));
+  const byFrame = new Map();
+  const framePattern = /^CY(\d{4})Q([1-4])I$/;
+  for (const fact of rows) {
+    const match = framePattern.exec(fact.frame || "");
+    if (!match) continue;
+    const key = `${match[1]}Q${match[2]}`;
+    if (!byFrame.has(key)) {
+      byFrame.set(key, {
+        periodLabel: key,
+        date: fact.end,
+        value: Number(fact.val),
+        filed: fact.filed || "",
+        form: fact.form || ""
+      });
+    }
+  }
+  const byDate = rows
+    .map((fact) => ({
+      date: fact.end,
+      value: Number(fact.val),
+      filed: fact.filed || "",
+      form: fact.form || ""
+    }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  return { byFrame, byDate };
+}
+
+function lastPointOnOrBefore(rows, date, valueKey = "value") {
+  if (!date) return null;
+  let match = null;
+  for (const row of rows || []) {
+    if (row.date > date) break;
+    if (Number.isFinite(Number(row[valueKey]))) match = row;
+  }
+  return match;
+}
+
+function financialMarketDateRange(points = []) {
+  const dates = points.map((point) => parseDate(point.date)).filter(Boolean);
+  if (!dates.length) return null;
+  const min = new Date(Math.min(...dates.map((date) => date.getTime())));
+  const max = new Date(Math.max(...dates.map((date) => date.getTime())));
+  return {
+    from: toDateOnly(addDays(min, -10)),
+    to: toDateOnly(addDays(max, 5))
+  };
+}
+
+function attachUsMarketCap(points, sharesFacts, prices) {
+  return points.map((point) => {
+    const price = lastPointOnOrBefore(prices, point.date, "close");
+    const shares =
+      sharesFacts.byFrame.get(point.periodLabel) ||
+      lastPointOnOrBefore(sharesFacts.byDate, point.date, "value");
+    const marketCap =
+      Number.isFinite(Number(price?.close)) && Number.isFinite(Number(shares?.value))
+        ? Number(price.close) * Number(shares.value)
+        : null;
+    return {
+      ...point,
+      marketCap,
+      marketCapTradeDate: price?.date || "",
+      sharePrice: price?.close ?? null,
+      sharesOutstanding: shares?.value ?? null,
+      sharesOutstandingDate: shares?.date || ""
+    };
+  });
+}
+
+function usLatestMarketCap(symbol, sharesFacts, prices) {
+  const latestPrice = [...(prices || [])]
+    .filter((row) => Number.isFinite(Number(row.close)))
+    .sort((a, b) => String(b.date).localeCompare(String(a.date)))[0];
+  const latestShares = [...(sharesFacts?.byDate || [])]
+    .filter((row) => Number.isFinite(Number(row.value)))
+    .sort((a, b) => String(b.date).localeCompare(String(a.date)))[0];
+  const value =
+    Number.isFinite(Number(latestPrice?.close)) && Number.isFinite(Number(latestShares?.value))
+      ? Number(latestPrice.close) * Number(latestShares.value)
+      : null;
+  return {
+    value,
+    tradeDate: latestPrice?.date || "",
+    sharePrice: latestPrice?.close ?? null,
+    sharesOutstanding: latestShares?.value ?? null,
+    sharesOutstandingDate: latestShares?.date || "",
+    source: "Nasdaq 最新历史收盘价 × SEC 最新披露股本",
+    symbol
+  };
 }
 
 function normalizeUsFinancialPoint(year, maps) {
@@ -3438,6 +4085,7 @@ function normalizeUsFinancialPoint(year, maps) {
     date: maps.revenue?.get(year)?.date || maps.netIncome?.get(year)?.date || `${year}-12-31`,
     revenue: value("revenue"),
     netIncome: value("netIncome"),
+    grossProfit: value("grossProfit"),
     operatingProfit: value("operatingProfit"),
     operatingCashFlow: value("operatingCashFlow"),
     contractLiabilities: value("contractLiabilities"),
@@ -3453,6 +4101,12 @@ function normalizeUsFinancialPoint(year, maps) {
 
 function normalizeUsQuarterlyPoint(periodKey, maps) {
   const value = (key) => maps[key]?.get(periodKey)?.value ?? null;
+  const derivedMetrics = Object.fromEntries(
+    US_Q4_DERIVED_FLOW_KEYS
+      .map((key) => [key, maps[key]?.get(periodKey)])
+      .filter(([, point]) => point?.derived)
+      .map(([key, point]) => [key, point.derivation || "derived"])
+  );
   const revenuePoint = maps.revenue?.get(periodKey);
   const netIncomePoint = maps.netIncome?.get(periodKey);
   const source = revenuePoint || netIncomePoint || maps.totalAssets?.get(periodKey) || {};
@@ -3467,6 +4121,7 @@ function normalizeUsQuarterlyPoint(periodKey, maps) {
     date: source.date || "",
     revenue: value("revenue"),
     netIncome: value("netIncome"),
+    grossProfit: value("grossProfit"),
     operatingProfit: value("operatingProfit"),
     operatingCashFlow: value("operatingCashFlow"),
     contractLiabilities: value("contractLiabilities"),
@@ -3477,15 +4132,19 @@ function normalizeUsQuarterlyPoint(periodKey, maps) {
     accountsReceivable: value("accountsReceivable"),
     inventory: value("inventory"),
     debtAssetRatio: assets && liabilities ? liabilities / assets : null,
-    sourcePeriodType: "reported-quarter-frame",
-    derivation: "SEC companyfacts explicit quarterly frame"
+    derivedMetrics,
+    sourcePeriodType: Object.keys(derivedMetrics).length ? "derived-flow" : "reported-quarter-frame",
+    derivation: Object.keys(derivedMetrics).length
+      ? "Flow metrics derived from cumulative YTD/FY facts when explicit quarterly frames are unavailable; non-flow metrics use explicit instant facts when available"
+      : "SEC companyfacts explicit quarterly frame"
   };
 }
 
-async function getUsFinancials(symbol, force = false) {
+async function getUsFinancials(symbol, force = false, options = {}) {
   const normalized = normalizeTicker(symbol || "");
   if (!normalized) throw new Error("缺少美股代码");
-  const cacheName = `us-financials-v3-${normalized}.json`;
+  const includeMarketCap = options.includeMarketCap !== false;
+  const cacheName = `${includeMarketCap ? "us-financials-v9" : "us-financials-core-v6"}-${normalized}.json`;
   if (!force) {
     const cached = await readCache(cacheName, SEC_TTL);
     if (cached) return { ...cached, cache: "hit" };
@@ -3509,12 +4168,18 @@ async function getUsFinancials(symbol, force = false) {
       })
     ])
   );
+  mergeDerivedQuarterlyFacts(
+    quarterlyMaps.operatingCashFlow,
+    deriveUsQuarterlyFlowFactsFromYtd(facts, US_FINANCIAL_CONCEPTS.operatingCashFlow)
+  );
+  deriveUsQ4FlowFacts(maps, quarterlyMaps);
+  const sharesFacts = includeMarketCap ? pickUsSharesOutstandingFacts(facts) : null;
   const years = [
     ...new Set(
       Object.values(maps).flatMap((map) => [...map.keys()])
     )
   ].sort((a, b) => a - b);
-  const annual = years.map((year) => normalizeUsFinancialPoint(year, maps));
+  const annualBase = years.map((year) => normalizeUsFinancialPoint(year, maps));
   const quarterKeys = [
     ...new Set(Object.values(quarterlyMaps).flatMap((map) => [...map.keys()]))
   ].sort((a, b) => {
@@ -3523,7 +4188,15 @@ async function getUsFinancials(symbol, force = false) {
     if (ay !== by) return ay - by;
     return Number(a.slice(-1)) - Number(b.slice(-1));
   });
-  const quarterly = quarterKeys.map((key) => normalizeUsQuarterlyPoint(key, quarterlyMaps));
+  const quarterlyBase = quarterKeys.map((key) => normalizeUsQuarterlyPoint(key, quarterlyMaps));
+  const priceRange = includeMarketCap ? financialMarketDateRange(quarterlyBase.length ? quarterlyBase : annualBase) : null;
+  const today = toDateOnly(new Date());
+  const prices = priceRange
+    ? await fetchNasdaqHistoricalPrices(normalized, priceRange.from, today > priceRange.to ? today : priceRange.to, force)
+    : [];
+  const annual = includeMarketCap ? attachUsMarketCap(annualBase, sharesFacts, prices) : annualBase;
+  const quarterly = includeMarketCap ? attachUsMarketCap(quarterlyBase, sharesFacts, prices) : quarterlyBase;
+  const latestMarketCap = includeMarketCap ? usLatestMarketCap(normalized, sharesFacts, prices) : null;
   const payload = {
     market: "us",
     symbol: normalized,
@@ -3535,11 +4208,18 @@ async function getUsFinancials(symbol, force = false) {
     unitLabel: "十亿美元",
     metrics: FINANCIAL_METRICS,
     accuracyNotes: [
-      "美股季度数据优先使用 SEC companyfacts 中带明确季度 frame 的 XBRL 事实；缺少明确季度 frame 的指标不会被猜算。",
-      "年度数据来自 10-K/20-F/40-F 年度事实，季度图表和年度表分开保留口径。"
+      "美股季度数据优先使用 SEC companyfacts 中带明确季度 frame 的 XBRL 事实；若 Q4 流量指标没有单独季度 frame，但同一 us-gaap 概念存在全年 FY 与 Q1-Q3，则按 FY - Q1 - Q2 - Q3 派生 Q4。",
+      "经营现金流等现金流量表指标常以年初至报告期末累计口径披露；若缺少单季 frame，则按 Q1、H1-Q1、9M-H1、FY-9M 拆分为单季现金流。",
+      "年度数据来自 10-K/20-F/40-F 年度事实，季度图表和年度表分开保留口径。",
+      "美股 SEC companyfacts 没有稳定的季度股东人数结构化字段，股东人数趋势暂不做猜算。",
+      ...(includeMarketCap
+        ? ["历史市值按报告期末或之前最近 Nasdaq 交易日收盘价乘以 SEC 披露股本估算；图表最右侧追加最新交易日市值；价格或股本缺失时不补值。"]
+        : [])
     ],
     annual,
     quarterly,
+    latestMarketCap,
+    shareholderTrend: [],
     recent: (quarterly.length ? quarterly : annual).slice(-16).reverse()
   };
   await writeCache(cacheName, payload);
@@ -3752,6 +4432,685 @@ function defaultIndustryContext(profile = {}) {
   };
 }
 
+function pctDisplay(value, digits = 2) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "";
+  return `${number.toFixed(digits)}%`;
+}
+
+function ashareSecucodeFromCode(symbol) {
+  const code = String(symbol || "").replace(/\D/g, "").slice(0, 6);
+  if (!code) return "";
+  if (code.startsWith("6")) return `${code}.SH`;
+  if (code.startsWith("8") || code.startsWith("9") || code.startsWith("4")) return `${code}.BJ`;
+  return `${code}.SZ`;
+}
+
+function eastmoneyF10Code(secucode) {
+  const code = String(secucode || "").slice(0, 6);
+  return `${ashareMarketPrefix(secucode)}${code}`;
+}
+
+function eastmoneyF10Url(section, secucode) {
+  const query = new URLSearchParams({ code: eastmoneyF10Code(secucode) });
+  return `https://emweb.securities.eastmoney.com/PC_HSF10/${section}/PageAjax?${query.toString()}`;
+}
+
+async function fetchEastmoneyF10Section(section, secucode, force = false) {
+  return cachedEastmoneyJson(eastmoneyF10Url(section, secucode), force, PROFILE_TTL);
+}
+
+function normalizeEastmoneyBoardCode(boardCode) {
+  const raw = String(boardCode || "").trim().toUpperCase();
+  if (!raw) return "";
+  if (raw.startsWith("BK")) return raw;
+  const digits = raw.replace(/\D/g, "");
+  if (!digits) return "";
+  return `BK${digits.padStart(4, "0")}`;
+}
+
+function eastmoneyBoardSecid(boardCode) {
+  const normalized = normalizeEastmoneyBoardCode(boardCode);
+  return normalized ? `90.${normalized}` : "";
+}
+
+function parseEastmoneyKlineRow(row) {
+  const parts = String(row || "").split(",");
+  return {
+    date: parts[0] || "",
+    open: finiteOrNull(parts[1]),
+    close: finiteOrNull(parts[2]),
+    high: finiteOrNull(parts[3]),
+    low: finiteOrNull(parts[4]),
+    volume: finiteOrNull(parts[5]),
+    amount: finiteOrNull(parts[6]),
+    amplitudePct: finiteOrNull(parts[7]),
+    changePct: finiteOrNull(parts[8]),
+    change: finiteOrNull(parts[9]),
+    turnoverPct: finiteOrNull(parts[10])
+  };
+}
+
+function klineChange(rows = [], lookback) {
+  const valid = rows.filter((row) => Number.isFinite(Number(row.close)));
+  if (valid.length < 2) return null;
+  const last = valid[valid.length - 1];
+  const first = lookback ? valid[Math.max(0, valid.length - lookback)] : valid[0];
+  if (!Number.isFinite(first?.close) || Math.abs(first.close) < 1) return null;
+  return (last.close - first.close) / Math.abs(first.close);
+}
+
+function priceReactionLeg(basePoint, targetPoint) {
+  if (!basePoint || !targetPoint) return null;
+  const baseClose = Number(basePoint.close);
+  const targetClose = Number(targetPoint.close);
+  if (!Number.isFinite(baseClose) || !Number.isFinite(targetClose) || Math.abs(baseClose) < 1e-9) return null;
+  return {
+    fromDate: basePoint.date || "",
+    toDate: targetPoint.date || "",
+    fromClose: baseClose,
+    toClose: targetClose,
+    pct: (targetClose - baseClose) / Math.abs(baseClose)
+  };
+}
+
+function buildAnnouncementReaction(eventDate, prices = [], source = "") {
+  const parsedEventDate = parseDate(eventDate);
+  if (!eventDate || !parsedEventDate) {
+    return {
+      status: "missing",
+      conclusion: "缺少披露日",
+      note: "没有可用于验证股价反应的财报披露日期",
+      source
+    };
+  }
+  const normalizedDate = toDateOnly(parsedEventDate);
+  const valid = [...prices]
+    .filter((point) => point?.date && Number.isFinite(Number(point.close)))
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  if (!valid.length) {
+    return {
+      eventDate: normalizedDate,
+      status: "missing",
+      conclusion: "缺少行情",
+      note: "未取得披露日前后的日线收盘价",
+      source
+    };
+  }
+
+  let baseIndex = -1;
+  for (let index = 0; index < valid.length; index += 1) {
+    if (valid[index].date <= normalizedDate) baseIndex = index;
+  }
+  if (baseIndex < 0) baseIndex = valid.findIndex((point) => point.date >= normalizedDate);
+  const basePoint = valid[baseIndex] || null;
+  if (!basePoint) {
+    return {
+      eventDate: normalizedDate,
+      status: "missing",
+      conclusion: "缺少基准价",
+      note: "无法定位披露日对应的交易日收盘价",
+      source
+    };
+  }
+
+  const legAtOffset = (offset) =>
+    baseIndex + offset >= 0 && baseIndex + offset < valid.length
+      ? priceReactionLeg(basePoint, valid[baseIndex + offset])
+      : null;
+  const pre20 =
+    baseIndex - 20 >= 0 && baseIndex - 20 < valid.length
+      ? priceReactionLeg(valid[baseIndex - 20], basePoint)
+      : null;
+  const pre60 =
+    baseIndex - 60 >= 0 && baseIndex - 60 < valid.length
+      ? priceReactionLeg(valid[baseIndex - 60], basePoint)
+      : null;
+  const post1 = legAtOffset(1);
+  const post5 = legAtOffset(5);
+  const post20 = legAtOffset(20);
+  const latestPoint = valid[valid.length - 1];
+  const postLatest =
+    latestPoint && latestPoint.date > basePoint.date ? priceReactionLeg(basePoint, latestPoint) : null;
+  const postForConclusion = post20 || post5 || postLatest;
+  let conclusion = "等待验证";
+  let status = "pending";
+  if (postForConclusion) {
+    const postPct = Number(postForConclusion.pct);
+    const prePct = Number(pre20?.pct);
+    status = "ok";
+    if (Number.isFinite(prePct) && prePct >= 0.15 && postPct <= -0.05) {
+      conclusion = "利好兑现";
+    } else if (postPct <= -0.15) {
+      conclusion = "财报后走弱";
+    } else if (postPct <= -0.05) {
+      conclusion = "短线承压";
+    } else if (postPct >= 0.15) {
+      conclusion = "市场继续确认";
+    } else if (postPct >= 0.05) {
+      conclusion = "温和确认";
+    } else {
+      conclusion = "中性观察";
+    }
+  }
+
+  return {
+    eventDate: normalizedDate,
+    baseDate: basePoint.date,
+    baseClose: Number(basePoint.close),
+    baseTiming: basePoint.date === normalizedDate ? "披露日收盘" : "披露日前最近交易日收盘",
+    pre20,
+    pre60,
+    post1,
+    post5,
+    post20,
+    postLatest,
+    latestDate: latestPoint?.date || "",
+    latestClose: latestPoint ? Number(latestPoint.close) : null,
+    status,
+    conclusion,
+    note: post20
+      ? "已覆盖披露后 20 个交易日"
+      : postLatest
+        ? "披露后交易日不足 20 个，暂用最新可用交易日"
+        : "披露后暂无可用交易日",
+    source
+  };
+}
+
+function metricPreviewGrowth(metric) {
+  if (!metric) return null;
+  if (metric.turnaround) return 1;
+  const value = Number(metric.growthPct);
+  return Number.isFinite(value) ? value : null;
+}
+
+function hasPositiveCashFlowMetric(metric) {
+  const current = Number(metric?.current?.value);
+  return Number.isFinite(current) && current > 0;
+}
+
+function addPreviewReason(bucket, text) {
+  if (text && !bucket.includes(text)) bucket.push(text);
+}
+
+function buildAnnouncementPreview(row, reaction) {
+  if (!reaction || reaction.status === "missing" || reaction.status === "error") {
+    return {
+      status: "missing",
+      conclusion: "缺少前置数据",
+      tone: "missing",
+      confidence: 0,
+      riskScore: 0,
+      confirmScore: 0,
+      reasons: [reaction?.note || "没有可用于公告当日预判的披露日或行情数据"],
+      source: "财报前涨幅 + 财报质量规则"
+    };
+  }
+
+  const riskReasons = [];
+  const confirmReasons = [];
+  let riskScore = 0;
+  let confirmScore = 0;
+  const pre20 = Number(reaction.pre20?.pct);
+  const pre60 = Number(reaction.pre60?.pct);
+  const score = Number(row.score);
+  const revenueGrowth = metricPreviewGrowth(row.metrics?.revenue);
+  const netIncomeGrowth = metricPreviewGrowth(row.metrics?.netIncome);
+  const cashFlowGrowth = metricPreviewGrowth(row.metrics?.operatingCashFlow);
+  const grossMarginDelta = Number(row.metrics?.grossMarginDelta);
+  const operatingMarginDelta = Number(row.metrics?.operatingMarginDelta);
+  const signalLabels = new Set((row.signals || []).map((signal) => signal.label));
+  const strongSignalLabels = [
+    "产品供不应求",
+    "供给偏紧",
+    "需求旺盛",
+    "产品价格中枢持续上涨",
+    "行业高景气度上行",
+    "营收高增长",
+    "净利高增长"
+  ];
+  const strongSignalCount = strongSignalLabels.filter((label) => signalLabels.has(label)).length;
+
+  if (Number.isFinite(pre20)) {
+    if (pre20 >= 0.3) {
+      riskScore += 45;
+      addPreviewReason(riskReasons, `财报前20交易日已大涨 ${pctDisplay(pre20 * 100, 1)}`);
+    } else if (pre20 >= 0.15) {
+      riskScore += 24;
+      addPreviewReason(riskReasons, `财报前20交易日上涨 ${pctDisplay(pre20 * 100, 1)}`);
+    } else if (pre20 >= 0.08) {
+      riskScore += 12;
+      addPreviewReason(riskReasons, `财报前20交易日已有一定涨幅 ${pctDisplay(pre20 * 100, 1)}`);
+    } else if (pre20 <= -0.08) {
+      confirmScore += 10;
+      addPreviewReason(confirmReasons, `财报前20交易日未提前上涨，预期差空间更大`);
+    }
+  }
+  if (Number.isFinite(pre60)) {
+    if (pre60 >= 0.5) {
+      riskScore += 35;
+      addPreviewReason(riskReasons, `财报前60交易日涨幅过高 ${pctDisplay(pre60 * 100, 1)}`);
+    } else if (pre60 >= 0.3) {
+      riskScore += 22;
+      addPreviewReason(riskReasons, `财报前60交易日明显上涨 ${pctDisplay(pre60 * 100, 1)}`);
+    } else if (pre60 <= 0.02) {
+      confirmScore += 8;
+      addPreviewReason(confirmReasons, "财报前60交易日未明显提前交易利好");
+    }
+  }
+
+  if (Number.isFinite(score)) {
+    if (score >= 90) {
+      confirmScore += 24;
+      addPreviewReason(confirmReasons, `财报亮眼度 ${score}，基本面信号很强`);
+    } else if (score >= 75) {
+      confirmScore += 18;
+      addPreviewReason(confirmReasons, `财报亮眼度 ${score}，基本面信号较强`);
+    } else if (score < 45) {
+      riskScore += 12;
+      addPreviewReason(riskReasons, `财报亮眼度仅 ${score}，业绩惊喜不足`);
+    }
+  }
+  if (Number.isFinite(revenueGrowth)) {
+    if (revenueGrowth >= 1) {
+      confirmScore += 18;
+      addPreviewReason(confirmReasons, "营收同比翻倍");
+    } else if (revenueGrowth >= 0.5) {
+      confirmScore += 12;
+      addPreviewReason(confirmReasons, "营收同比>50%");
+    } else if (revenueGrowth < 0.1) {
+      riskScore += 8;
+      addPreviewReason(riskReasons, "营收增长不强");
+    }
+  }
+  if (row.metrics?.netIncome?.turnaround) {
+    confirmScore += 12;
+    addPreviewReason(confirmReasons, "净利润扭亏");
+  } else if (Number.isFinite(netIncomeGrowth)) {
+    if (netIncomeGrowth >= 1) {
+      confirmScore += 18;
+      addPreviewReason(confirmReasons, "净利润同比翻倍");
+    } else if (netIncomeGrowth >= 0.5) {
+      confirmScore += 12;
+      addPreviewReason(confirmReasons, "净利润同比>50%");
+    } else if (netIncomeGrowth < 0.1) {
+      riskScore += 8;
+      addPreviewReason(riskReasons, "净利润增长不强");
+    }
+  }
+  if (Number.isFinite(operatingMarginDelta) && operatingMarginDelta >= 0.02) {
+    confirmScore += operatingMarginDelta >= 0.05 ? 14 : 8;
+    addPreviewReason(confirmReasons, `经营利润率提升 ${(operatingMarginDelta * 100).toFixed(1)}pct`);
+  } else if (Number.isFinite(grossMarginDelta) && grossMarginDelta >= 0.02) {
+    confirmScore += grossMarginDelta >= 0.05 ? 12 : 7;
+    addPreviewReason(confirmReasons, `毛利率提升 ${(grossMarginDelta * 100).toFixed(1)}pct`);
+  }
+  if (row.metrics?.operatingCashFlow?.turnaround) {
+    confirmScore += 10;
+    addPreviewReason(confirmReasons, "经营现金流扭亏");
+  } else if (Number.isFinite(cashFlowGrowth) && cashFlowGrowth >= 0.25) {
+    confirmScore += cashFlowGrowth >= 1 ? 12 : 8;
+    addPreviewReason(confirmReasons, "经营现金流同比改善");
+  } else if (hasPositiveCashFlowMetric(row.metrics?.operatingCashFlow)) {
+    confirmScore += 5;
+    addPreviewReason(confirmReasons, "经营现金流为正");
+  }
+  if (strongSignalCount) {
+    confirmScore += Math.min(20, strongSignalCount * 8);
+    addPreviewReason(confirmReasons, `命中 ${strongSignalCount} 个景气度/高增长信号`);
+  } else if (Number.isFinite(pre20) && pre20 >= 0.15) {
+    riskScore += 8;
+    addPreviewReason(riskReasons, "股价已涨但缺少明确景气度信号");
+  }
+
+  let conclusion = "预期差中性";
+  let tone = "neutral";
+  if (riskScore >= 58 && confirmScore < 55) {
+    conclusion = "利好兑现风险高";
+    tone = "bad";
+  } else if (confirmScore >= 78 && riskScore <= 45) {
+    conclusion = "继续确认概率高";
+    tone = "good";
+  } else if (
+    riskScore >= 55 && confirmScore >= 70 ||
+    confirmScore >= 65 && (Number(pre20) >= 0.25 || Number(pre60) >= 0.35)
+  ) {
+    conclusion = "强势确认但波动高";
+    tone = "neutral";
+  } else if (confirmScore >= 62) {
+    conclusion = "偏继续确认";
+    tone = "good";
+  } else if (riskScore >= 45) {
+    conclusion = "兑现风险偏高";
+    tone = "bad";
+  }
+
+  const evidenceCount = [
+    Number.isFinite(pre20),
+    Number.isFinite(pre60),
+    Number.isFinite(score),
+    Number.isFinite(revenueGrowth),
+    Number.isFinite(netIncomeGrowth) || row.metrics?.netIncome?.turnaround,
+    Number.isFinite(operatingMarginDelta) || Number.isFinite(grossMarginDelta),
+    row.metrics?.operatingCashFlow?.current,
+    strongSignalCount > 0
+  ].filter(Boolean).length;
+  const confidence = Math.min(90, Math.max(25, 25 + evidenceCount * 8 + Math.min(18, Math.abs(confirmScore - riskScore) / 2)));
+
+  return {
+    status: "ok",
+    conclusion,
+    tone,
+    confidence: Math.round(confidence),
+    riskScore: Math.round(riskScore),
+    confirmScore: Math.round(confirmScore),
+    pre20: reaction.pre20 || null,
+    pre60: reaction.pre60 || null,
+    reasons: [...confirmReasons.slice(0, 4), ...riskReasons.slice(0, 4)],
+    confirmReasons,
+    riskReasons,
+    source: "财报前涨幅 + 财报质量 + 现金流/利润率 + 景气度信号规则",
+    note: "仅使用披露日前/披露日可见数据做早期预判，需结合后续交易验证"
+  };
+}
+
+async function fetchAshareHistoricalPrices(secucode, fromDate, toDate, force = false) {
+  const secid = ashareQuoteSecid(secucode);
+  if (!secid || !fromDate || !toDate) return [];
+  const params = new URLSearchParams({
+    secid,
+    fields1: "f1,f2,f3,f4,f5,f6",
+    fields2: "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+    klt: "101",
+    fqt: "1",
+    beg: String(fromDate).replace(/-/g, ""),
+    end: String(toDate).replace(/-/g, ""),
+    lmt: "160"
+  });
+  try {
+    const payload = await cachedEastmoneyJson(
+      `https://push2his.eastmoney.com/api/qt/stock/kline/get?${params.toString()}`,
+      force,
+      SEC_TTL
+    );
+    return (payload?.data?.klines || [])
+      .map(parseEastmoneyKlineRow)
+      .filter((row) => row.date && Number.isFinite(Number(row.close)))
+      .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  } catch {
+    return [];
+  }
+}
+
+async function fetchAnnouncementReaction(row, market, force = false) {
+  const eventDate = row?.filing?.filingDate || "";
+  if (!eventDate) {
+    return buildAnnouncementReaction("", [], market === "cn" ? "东方财富日 K" : "Nasdaq historical");
+  }
+  const event = parseDate(eventDate);
+  if (!event) {
+    return buildAnnouncementReaction("", [], market === "cn" ? "东方财富日 K" : "Nasdaq historical");
+  }
+  const fromDate = toDateOnly(addDays(event, -140));
+  const endByEvent = toDateOnly(addDays(event, 60));
+  const today = toDateOnly(new Date());
+  const toDate = endByEvent < today ? endByEvent : today;
+  if (toDate < fromDate) {
+    return buildAnnouncementReaction(eventDate, [], market === "cn" ? "东方财富日 K" : "Nasdaq historical");
+  }
+  const prices =
+    market === "cn"
+      ? await fetchAshareHistoricalPrices(ashareSecucodeFromCode(row.symbol), fromDate, toDate, force)
+      : await fetchNasdaqHistoricalPrices(row.symbol, fromDate, toDate, force);
+  return buildAnnouncementReaction(
+    eventDate,
+    prices,
+    market === "cn" ? "东方财富日 K 收盘价" : "Nasdaq historical daily close"
+  );
+}
+
+async function attachAnnouncementReactions(rows, market, force = false, progress = null) {
+  if (!rows?.length) return;
+  emitProgress(progress, "price-reaction", `计算财报公告后股价验证：${rows.length} 家`, {
+    market,
+    rows: rows.length
+  });
+  let done = 0;
+  await mapLimit(rows, 4, async (row) => {
+    try {
+      row.announcementReaction = await fetchAnnouncementReaction(row, market, force);
+      row.announcementPreview = buildAnnouncementPreview(row, row.announcementReaction);
+    } catch (error) {
+      row.announcementReaction = {
+        eventDate: row?.filing?.filingDate || "",
+        status: "error",
+        conclusion: "行情获取失败",
+        note: error.message,
+        source: market === "cn" ? "东方财富日 K 收盘价" : "Nasdaq historical daily close"
+      };
+      row.announcementPreview = buildAnnouncementPreview(row, row.announcementReaction);
+    } finally {
+      done += 1;
+      if (done === 1 || done % 50 === 0 || done === rows.length) {
+        emitProgress(progress, "price-reaction", `公告后验证 ${done}/${rows.length} 家`, {
+          market,
+          done,
+          total: rows.length
+        });
+      }
+    }
+  });
+}
+
+async function fetchEastmoneyBoardMarket(boardCode, force = false) {
+  const normalized = normalizeEastmoneyBoardCode(boardCode);
+  const secid = eastmoneyBoardSecid(normalized);
+  if (!secid) return null;
+  const quoteParams = new URLSearchParams({
+    ut: "bd1d9ddb04089700cf9c27f6f7426281",
+    fltt: "2",
+    invt: "2",
+    secid,
+    fields: "f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f107,f116,f117,f152,f162,f168,f169,f170"
+  });
+  const end = toDateOnly(new Date()).replace(/-/g, "");
+  const begin = toDateOnly(addDays(new Date(), -365)).replace(/-/g, "");
+  const klineParams = new URLSearchParams({
+    secid,
+    fields1: "f1,f2,f3,f4,f5,f6",
+    fields2: "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+    klt: "101",
+    fqt: "1",
+    beg: begin,
+    end,
+    lmt: "260"
+  });
+  const [quotePayload, klinePayload] = await Promise.all([
+    cachedEastmoneyJson(`https://push2.eastmoney.com/api/qt/stock/get?${quoteParams.toString()}`, force, SEC_TTL),
+    cachedEastmoneyJson(`https://push2his.eastmoney.com/api/qt/stock/kline/get?${klineParams.toString()}`, force, SEC_TTL)
+  ]);
+  const quote = quotePayload?.data || {};
+  const klines = (klinePayload?.data?.klines || []).map(parseEastmoneyKlineRow).filter((row) => row.date);
+  return {
+    boardCode: normalized,
+    boardName: quote.f58 || klinePayload?.data?.name || "",
+    source: "东方财富板块行情 push2/push2his",
+    updatedAt: quote.f124 ? new Date(Number(quote.f124) * 1000).toISOString() : "",
+    latest: {
+      close: finiteOrNull(quote.f43),
+      previousClose: finiteOrNull(quote.f60),
+      change: finiteOrNull(quote.f169),
+      changePct: finiteOrNull(quote.f170),
+      high: finiteOrNull(quote.f44),
+      low: finiteOrNull(quote.f45),
+      open: finiteOrNull(quote.f46),
+      amount: finiteOrNull(quote.f48),
+      totalMarketCap: finiteOrNull(quote.f116),
+      floatMarketCap: finiteOrNull(quote.f117),
+      pe: finiteOrNull(quote.f162),
+      turnoverPct: finiteOrNull(quote.f168)
+    },
+    trend: {
+      samples: klines.length,
+      firstDate: klines[0]?.date || "",
+      lastDate: klines[klines.length - 1]?.date || "",
+      change20d: klineChange(klines, 20),
+      change60d: klineChange(klines, 60),
+      change1y: klineChange(klines, 0)
+    },
+    recentKlines: klines.slice(-20)
+  };
+}
+
+function latestAshareBusinessSegments(rows = []) {
+  const sortedDates = [...new Set(rows.map((row) => ashareDate(row.REPORT_DATE)).filter(Boolean))].sort();
+  const latestDate = sortedDates[sortedDates.length - 1] || "";
+  const latestRows = rows
+    .filter((row) => ashareDate(row.REPORT_DATE) === latestDate)
+    .sort((a, b) => Number(b.MAIN_BUSINESS_INCOME || 0) - Number(a.MAIN_BUSINESS_INCOME || 0));
+  return {
+    reportDate: latestDate,
+    segments: latestRows.slice(0, 8).map((row) => ({
+      item: row.ITEM_NAME || "",
+      income: finiteOrNull(row.MAIN_BUSINESS_INCOME),
+      incomeDisplay: ashareMoney(row.MAIN_BUSINESS_INCOME),
+      incomeRatio: finiteOrNull(row.MBI_RATIO),
+      grossProfit: finiteOrNull(row.MAIN_BUSINESS_RPOFIT),
+      grossMargin: finiteOrNull(row.GROSS_RPOFIT_RATIO),
+      rank: finiteOrNull(row.RANK)
+    }))
+  };
+}
+
+function summarizeAsharePeerGrowth(rows = []) {
+  return rows.slice(0, 8).map((row) => ({
+    symbol: row.CORRE_SECURITY_CODE || "",
+    name: row.CORRE_SECURITY_NAME || "",
+    revenueGrowthPct: finiteOrNull(row.YYSRTB),
+    netIncomeGrowthPct: finiteOrNull(row.JLRTB),
+    ttmRevenueGrowthPct: finiteOrNull(row.YYSRTTM),
+    ttmNetIncomeGrowthPct: finiteOrNull(row.JLRTTM),
+    rank: finiteOrNull(row.PAIMING),
+    reportDate: ashareDate(row.REPORT_DATE)
+  }));
+}
+
+function summarizeAsharePeerValuation(rows = []) {
+  return rows.slice(0, 8).map((row) => ({
+    symbol: row.CORRE_SECURITY_CODE || "",
+    name: row.CORRE_SECURITY_NAME || "",
+    peTtm: finiteOrNull(row.PE_TTM),
+    psTtm: finiteOrNull(row.PS_TTM),
+    pbMrq: finiteOrNull(row.PB_MRQ),
+    pcfTtm: finiteOrNull(row.PCF_TTM)
+  }));
+}
+
+function summarizeAsharePeerQuality(rows = []) {
+  return rows.slice(0, 8).map((row) => ({
+    symbol: row.CORRE_SECURITY_CODE || "",
+    name: row.CORRE_SECURITY_NAME || "",
+    roeAvg: finiteOrNull(row.ROE_AVG),
+    netMarginAvg: finiteOrNull(row.XSJLL_AVG),
+    assetTurnoverAvg: finiteOrNull(row.TOAZZL_AVG),
+    equityMultiplierAvg: finiteOrNull(row.QYCS_AVG)
+  }));
+}
+
+function boardTrendSummary(boardMarket) {
+  if (!boardMarket) return "";
+  const trend = boardMarket.trend || {};
+  const latest = boardMarket.latest || {};
+  return [
+    boardMarket.boardName ? `${boardMarket.boardName}板块` : boardMarket.boardCode,
+    Number.isFinite(Number(latest.changePct)) ? `最新涨跌幅 ${pctDisplay(latest.changePct)}` : "",
+    Number.isFinite(Number(trend.change20d)) ? `近20日 ${pctDisplay(trend.change20d * 100)}` : "",
+    Number.isFinite(Number(trend.change60d)) ? `近60日 ${pctDisplay(trend.change60d * 100)}` : "",
+    Number.isFinite(Number(trend.change1y)) ? `近一年 ${pctDisplay(trend.change1y * 100)}` : ""
+  ].filter(Boolean).join("，");
+}
+
+async function fetchAshareIndustryStructuredContext(financials, profile = {}, force = false) {
+  if (financials.market !== "cn") return null;
+  const secucode = ashareSecucodeFromCode(financials.symbol);
+  if (!secucode) return null;
+  const [core, business, industry] = await Promise.all([
+    fetchEastmoneyF10Section("CoreConception", secucode, force),
+    fetchEastmoneyF10Section("BusinessAnalysis", secucode, force),
+    fetchEastmoneyF10Section("IndustryAnalysis", secucode, force)
+  ]);
+  const boards = (core?.ssbk || [])
+    .sort((a, b) => Number(a.BOARD_RANK || 99) - Number(b.BOARD_RANK || 99))
+    .slice(0, 8)
+    .map((row) => ({
+      code: normalizeEastmoneyBoardCode(row.BOARD_CODE),
+      name: row.BOARD_NAME || "",
+      rank: finiteOrNull(row.BOARD_RANK),
+      precise: row.IS_PRECISE === "1"
+    }));
+  const primaryBoard = boards.find((board) => board.code) || null;
+  const boardMarket = primaryBoard ? await fetchEastmoneyBoardMarket(primaryBoard.code, force) : null;
+  const businessSegments = latestAshareBusinessSegments(business?.zygcfx || []);
+  const themes = (core?.hxtc || []).slice(0, 10).map((row) => ({
+    keyword: row.KEYWORD || "",
+    point: row.MAINPOINT || "",
+    content: compactAnalysisText(row.MAINPOINT_CONTENT || "", 260),
+    className: row.KEY_CLASSIF || ""
+  }));
+  const companyScale = (industry?.gsgm || [])[0] || {};
+  const boardNames = boards.map((board) => board.name).filter(Boolean);
+  const segmentNames = businessSegments.segments.map((item) => item.item).filter(Boolean).slice(0, 5);
+  return {
+    status: "ok",
+    source: "东方财富 F10 + 东方财富板块行情",
+    generatedAt: new Date().toISOString(),
+    key: `eastmoney:${secucode}`,
+    sector: profile.sector || "",
+    industry: profile.industry || "",
+    cycleStage: `${boardTrendSummary(boardMarket) || "已接入东方财富板块行情，但板块趋势数据不足"}。这代表二级市场和同行表现线索，仍需结合商品价格、库存、订单和公司财报验证真实景气。`,
+    ceiling: `公司关联板块/题材包括 ${boardNames.slice(0, 6).join("、") || "未获取"}；主营构成包括 ${segmentNames.join("、") || "未获取"}。行业天花板仍需结合细分产品价格、供需、产能和成本曲线判断。`,
+    demandDrivers: [
+      ...themes.map((item) => item.keyword || item.point).filter(Boolean).slice(0, 5),
+      ...segmentNames.slice(0, 3)
+    ],
+    supplyConstraints: themes
+      .filter((item) => /产能|资源|矿|库存|供给|供应|成本|稀缺|技术|认证/.test(`${item.keyword}${item.point}${item.content}`))
+      .map((item) => item.content || item.point || item.keyword)
+      .slice(0, 5),
+    risks: [
+      ...themes
+        .filter((item) => /风险|竞争|价格|周期|波动|库存|产能|政策|环保|成本/.test(`${item.keyword}${item.point}${item.content}`))
+        .map((item) => item.content || item.point || item.keyword)
+        .slice(0, 5),
+      "东方财富 F10 不含完整商品价格、库存、开工率和订单数据；资源/周期行业仍需接 SHFE/LME/SMM/海关/统计局等原始数据。"
+    ],
+    eastmoneyF10: {
+      secucode,
+      boards,
+      themes,
+      businessScope: compactAnalysisText(business?.zyfw?.[0]?.BUSINESS_SCOPE || "", 420),
+      businessReview: compactAnalysisText(business?.jyps?.[0]?.BUSINESS_REVIEW || "", 520),
+      businessSegments,
+      peerGrowth: summarizeAsharePeerGrowth(industry?.czxbj || []),
+      peerValuation: summarizeAsharePeerValuation(industry?.gzbj || []),
+      peerQuality: summarizeAsharePeerQuality(industry?.dbfxbj || []),
+      companyScale: {
+        peerName: companyScale.CORRE_SECURITY_NAME || "",
+        totalCapRank: finiteOrNull(companyScale.TOTAL_CAP_RANK),
+        revenueRank: finiteOrNull(companyScale.TOTAL_OPERATEINCOME_RANK),
+        netProfitRank: finiteOrNull(companyScale.NETPROFIT_RANK),
+        reportType: companyScale.REPORT_TYPE || ""
+      }
+    },
+    boardMarket,
+    notes: [
+      "东方财富 F10 和板块行情可用于行业/同行/题材基础上下文，不等同于实时行业供需数据库。",
+      "资源、化工、半导体等强周期行业仍需补充商品价格、库存、开工率、订单和产能数据。"
+    ]
+  };
+}
+
 const US_MACRO_FRED_SERIES = [
   { id: "FEDFUNDS", label: "联邦基金有效利率（月度）" },
   { id: "DGS10", label: "10年期美国国债收益率（日度）" },
@@ -3912,39 +5271,58 @@ async function fetchIndustryWebSupplement(financials, profile = {}, force = fals
 
 async function supplementExternalAnalysisContext(financials, profile, baseExternal, force = false) {
   const external = baseExternal || externalAnalysisContext(financials, profile);
-  const tasks = [];
-  tasks.push(
-    needsWebSupplement(external.macroPolicy)
-      ? financials.market === "cn"
-        ? fetchChinaMacroPolicySupplement(force)
-        : fetchUsMacroPolicySupplement(force)
-      : Promise.resolve(null)
-  );
-  tasks.push(
-    needsWebSupplement(external.industryView)
+  const macroPromise = needsWebSupplement(external.macroPolicy)
+    ? financials.market === "cn"
+      ? fetchChinaMacroPolicySupplement(force)
+      : fetchUsMacroPolicySupplement(force)
+    : Promise.resolve(null);
+  let structuredIndustrySupplement = null;
+  if (financials.market === "cn" && needsWebSupplement(external.industryView)) {
+    try {
+      structuredIndustrySupplement = await fetchAshareIndustryStructuredContext(financials, profile, force);
+    } catch (error) {
+      structuredIndustrySupplement = {
+        status: "partial",
+        source: "东方财富 F10 + 东方财富板块行情",
+        generatedAt: new Date().toISOString(),
+        reason: `东方财富结构化行业数据获取失败：${error.message}`
+      };
+    }
+  }
+  const industryWebPromise =
+    needsWebSupplement(external.industryView) && structuredIndustrySupplement?.status !== "ok"
       ? fetchIndustryWebSupplement(financials, profile, force)
-      : Promise.resolve(null)
-  );
-  const [macroSupplement, industrySupplement] = await Promise.all(tasks);
+      : Promise.resolve(null);
+  const [macroSupplement, industrySupplement] = await Promise.all([macroPromise, industryWebPromise]);
+  const industryContext =
+    structuredIndustrySupplement?.status === "ok"
+      ? {
+          ...external.industryView,
+          ...structuredIndustrySupplement,
+          baseContext: external.industryView,
+          webSupplement: industrySupplement || null
+        }
+      : industrySupplement?.status === "ok"
+        ? { ...external.industryView, ...industrySupplement, baseContext: external.industryView }
+        : external.industryView;
   return {
     ...external,
-    source: macroSupplement || industrySupplement
-      ? "local analysis context config + public web supplement"
+    source: (macroSupplement || industrySupplement || structuredIndustrySupplement?.status === "ok")
+      ? "local analysis context config + public web/东方财富结构化补充"
       : external.source,
     generatedAt: new Date().toISOString(),
     macroPolicy: macroSupplement?.status === "ok"
       ? { ...external.macroPolicy, ...macroSupplement, baseContext: external.macroPolicy }
       : external.macroPolicy,
-    industryView: industrySupplement?.status === "ok"
-      ? { ...external.industryView, ...industrySupplement, baseContext: external.industryView }
-      : external.industryView,
+    industryView: industryContext,
     webSupplement: {
       generatedAt: new Date().toISOString(),
       macroPolicy: macroSupplement,
-      industryView: industrySupplement
+      industryView: industrySupplement,
+      structuredIndustryView: structuredIndustrySupplement
     },
     missingContextPolicy:
-      "若 macroPolicy 或 industryView 来自 public web supplement，可以作为联网补充证据；若仍为 partial，必须说明缺少实时原始数据，不能编造。companyOverride 为空时不能凭空判断公司竞争格局。"
+      "若 macroPolicy 或 industryView 来自 public web supplement 或东方财富结构化补充，可以作为联网补充证据；若仍为 partial，必须说明缺少实时原始数据，不能编造。companyOverride 为空时不能凭空判断公司竞争格局。"
   };
 }
 
@@ -4014,10 +5392,23 @@ const ANALYSIS_EVIDENCE_PATTERNS = [
   { label: "现金流/回款", pattern: /(?:cash flow|receivables?|collection|working capital|现金流|应收|回款|营运资金)/gi }
 ];
 
-function evidenceExcerpts(text, doc = {}, limit = 10) {
+const ANALYSIS_RISK_PATTERNS = [
+  { label: "现金流背离", pattern: /(?:经营活动产生的现金流量净额|经营现金流|现金流量|cash flow|operating cash).*?(?:为负|下降|减少|恶化|低于|背离|净流出|negative|decline|decrease|used in)/gi },
+  { label: "应收/回款风险", pattern: /(?:应收账款|应收款项|坏账|信用减值|回款|账龄|receivables?|allowance for credit losses|credit loss|collection)/gi },
+  { label: "存货/跌价风险", pattern: /(?:存货|库存|跌价准备|滞销|减值|inventory|write-down|obsolete|slow-moving)/gi },
+  { label: "客户集中风险", pattern: /(?:客户集中|前五大客户|第一大客户|主要客户|major customer|customer concentration|top customer)/gi },
+  { label: "毛利率/价格压力", pattern: /(?:毛利率|销售价格|产品价格|价格下降|价格波动|gross margin|pricing pressure|average selling price|ASP)/gi },
+  { label: "负债/流动性风险", pattern: /(?:资产负债率|短期借款|有息负债|流动性|偿债|债务|liquidity|debt|borrowings|going concern)/gi },
+  { label: "收入确认风险", pattern: /(?:收入确认|履约义务|合同资产|合同负债|退货|返利|revenue recognition|performance obligation|contract asset|contract liability)/gi },
+  { label: "诉讼/担保/或有事项", pattern: /(?:诉讼|仲裁|担保|或有负债|预计负债|违规|处罚|litigation|arbitration|guarantee|contingenc|penalt)/gi },
+  { label: "关联交易/资金占用", pattern: /(?:关联交易|关联方|资金占用|非经营性资金|related part|connected transaction)/gi },
+  { label: "审计/内控风险", pattern: /(?:非标|保留意见|强调事项|内部控制|重大缺陷|material weakness|internal control|qualified opinion|emphasis of matter)/gi }
+];
+
+function matchedEvidenceExcerpts(text, doc = {}, patterns = ANALYSIS_EVIDENCE_PATTERNS, limit = 10) {
   const output = [];
   const seen = new Set();
-  for (const item of ANALYSIS_EVIDENCE_PATTERNS) {
+  for (const item of patterns) {
     item.pattern.lastIndex = 0;
     let match;
     while ((match = item.pattern.exec(text)) && output.length < limit) {
@@ -4038,6 +5429,14 @@ function evidenceExcerpts(text, doc = {}, limit = 10) {
     if (output.length >= limit) break;
   }
   return output;
+}
+
+function evidenceExcerpts(text, doc = {}, limit = 10) {
+  return matchedEvidenceExcerpts(text, doc, ANALYSIS_EVIDENCE_PATTERNS, limit);
+}
+
+function riskEvidenceExcerpts(text, doc = {}, limit = 12) {
+  return matchedEvidenceExcerpts(text, doc, ANALYSIS_RISK_PATTERNS, limit);
 }
 
 function latestFilingByForms(filings = [], forms = [], options = {}) {
@@ -4074,10 +5473,14 @@ async function secDocumentEvidence(cik, filing, category, force = false) {
     const html = await cachedSecText(url, force, TEXT_TTL);
     const text = stripHtml(html);
     const excerpts = evidenceExcerpts(text, base);
+    const riskExcerpts = riskEvidenceExcerpts(text, base);
     return {
       ...base,
       excerptCount: excerpts.length,
+      riskExcerptCount: riskExcerpts.length,
+      textLength: text.length,
       excerpts,
+      riskExcerpts,
       textSample: text.slice(0, 900)
     };
   } catch (error) {
@@ -4085,7 +5488,8 @@ async function secDocumentEvidence(cik, filing, category, force = false) {
       ...base,
       status: "failed",
       reason: error.message,
-      excerpts: []
+      excerpts: [],
+      riskExcerpts: []
     };
   }
 }
@@ -4133,7 +5537,9 @@ async function buildUsEvidencePackage(financials, profile, force = false) {
       title: doc.title,
       url: doc.url || "",
       reason: doc.reason || "",
-      excerptCount: doc.excerptCount || 0
+      excerptCount: doc.excerptCount || 0,
+      riskExcerptCount: doc.riskExcerptCount || 0,
+      textLength: doc.textLength || 0
     }))
   ];
   return {
@@ -4189,9 +5595,14 @@ async function fetchAshareNoticesForEvidence(code, secucode, force = false) {
     }));
 }
 
-function ashareEvidenceDoc(notices, category, pattern) {
+function pickAshareEvidenceDoc(notices, category, pattern, options = {}) {
   const notice = notices
-    .filter((item) => pattern.test(ashareNoticeText(item)))
+    .filter((item) => {
+      const text = ashareNoticeText(item);
+      if (!pattern.test(text)) return false;
+      if (options.excludePattern?.test(text)) return false;
+      return true;
+    })
     .sort((a, b) => String(b.notice_date || b.display_time || "").localeCompare(String(a.notice_date || a.display_time || "")))[0];
   if (!notice) {
     return {
@@ -4204,14 +5615,66 @@ function ashareEvidenceDoc(notices, category, pattern) {
   const artCode = notice.art_code;
   return {
     category,
-    status: "partial",
+    status: "pending",
     title: notice.title_ch || notice.title || category,
     filingDate: ashareDate(notice.notice_date || notice.display_time || notice.sort_date),
     url: ashareReportPdfUrl(artCode),
     noticePageUrl: ashareNoticePageUrl(artCode),
-    reason: "已获取公告链接，当前版本暂未解析 PDF 正文",
+    artCode,
     excerpts: []
   };
+}
+
+async function ashareDocumentEvidence(doc, force = false) {
+  if (!doc || doc.status === "missing") return doc;
+  const base = {
+    ...doc,
+    form: doc.category === "financialReport" ? "A股财报 PDF" : "A股公告 PDF"
+  };
+  if (!base.url) {
+    return {
+      ...base,
+      status: "failed",
+      reason: "公告缺少 PDF 链接",
+      excerpts: [],
+      riskExcerpts: []
+    };
+  }
+  try {
+    const pageLast = base.category === "prospectus" ? 120 : 90;
+    const text = await cachedPdfText(base.url, force, TEXT_TTL, { first: 1, last: pageLast });
+    if (!text) {
+      return {
+        ...base,
+        status: "failed",
+        reason: "PDF 正文为空或无法抽取文字",
+        excerpts: [],
+        riskExcerpts: []
+      };
+    }
+    const excerpts = evidenceExcerpts(text, base, 10);
+    const riskExcerpts = riskEvidenceExcerpts(text, base, 12);
+    return {
+      ...base,
+      status: "ok",
+      reason: "",
+      excerptCount: excerpts.length,
+      riskExcerptCount: riskExcerpts.length,
+      textLength: text.length,
+      pageRange: `1-${pageLast}`,
+      excerpts,
+      riskExcerpts,
+      textSample: text.slice(0, 900)
+    };
+  } catch (error) {
+    return {
+      ...base,
+      status: "failed",
+      reason: `PDF 正文解析失败：${error.message}`,
+      excerpts: [],
+      riskExcerpts: []
+    };
+  }
 }
 
 async function buildAshareEvidencePackage(financials, profile, force = false) {
@@ -4231,11 +5694,20 @@ async function buildAshareEvidencePackage(financials, profile, force = false) {
       failures: [{ category: "announcements", reason: error.message }]
     };
   }
-  const documents = [
-    ashareEvidenceDoc(notices, "financialReport", /(?:年度报告|一季度报告|半年度报告|三季度报告)(?!摘要)|报告全文/),
-    ashareEvidenceDoc(notices, "prospectus", /招股说明书/),
-    ashareEvidenceDoc(notices, "investorRelations", /投资者关系活动记录|调研|业绩说明会/)
-  ];
+  const documents = await mapLimit(
+    [
+      pickAshareEvidenceDoc(
+        notices,
+        "financialReport",
+        /(?:年度报告|一季度报告|第一季度报告|半年度报告|三季度报告|第三季度报告)(?!摘要)|报告全文/,
+        { excludePattern: /投资者关系|活动记录|交流会|说明会|调研|业绩预告|业绩快报|问询|回复|摘要/ }
+      ),
+      pickAshareEvidenceDoc(notices, "prospectus", /招股说明书/),
+      pickAshareEvidenceDoc(notices, "investorRelations", /投资者关系活动记录|调研|业绩说明会/)
+    ],
+    2,
+    (doc) => ashareDocumentEvidence(doc, force)
+  );
   const coverage = [
     {
       category: "companyProfile",
@@ -4249,7 +5721,10 @@ async function buildAshareEvidencePackage(financials, profile, force = false) {
       status: doc.status,
       title: doc.title,
       url: doc.url || doc.noticePageUrl || "",
-      reason: doc.reason || ""
+      reason: doc.reason || "",
+      excerptCount: doc.excerptCount || 0,
+      riskExcerptCount: doc.riskExcerptCount || 0,
+      textLength: doc.textLength || 0
     }))
   ];
   return {
@@ -4332,6 +5807,10 @@ function compactEvidencePackageForAnalysis(packagePayload = {}) {
       excerpts: (Array.isArray(doc.excerpts) ? doc.excerpts : []).slice(0, 6).map((excerpt) => ({
         ...excerpt,
         context: compactAnalysisText(excerpt.context, 360)
+      })),
+      riskExcerpts: (Array.isArray(doc.riskExcerpts) ? doc.riskExcerpts : []).slice(0, 8).map((excerpt) => ({
+        ...excerpt,
+        context: compactAnalysisText(excerpt.context, 420)
       }))
     }))
   };
@@ -4434,6 +5913,8 @@ function buildFinancialAnalysisContext(financials, extras = {}) {
     accuracyNotes: financials.accuracyNotes || [],
     requiredRules: [
       "只能基于本 JSON 中的 raw/display 数值、period 和 accuracyNotes 做分析。",
+      "必须结合 evidencePackage.documents 中的 textSample、excerpts 和 riskExcerpts 分析财报/公告正文；riskExcerpts 是服务端从财报、招股书或投资者关系公告中抽取的潜在风险线索。",
+      "隐藏风险必须重点核对：收入增长与经营现金流是否背离、应收账款和存货是否异常扩张、合同负债/预收是否支撑需求、毛利率是否承压、客户集中/关联交易/诉讼担保/减值/流动性风险是否出现。",
       "商业质量分析必须基于 company.profile、evidencePackage、externalContext.companyOverride、财务指标之间的交叉验证；没有证据时必须写无法判断。",
       "当前经济、货币政策和行业景气天花板只能基于 externalContext.macroPolicy 与 externalContext.industryView；未提供时不能编造。",
       "如果 externalContext.macroPolicy 或 industryView 的 status 为 partial，必须把结论表述为分析框架或待验证变量，不能表述为实时确定结论。",
@@ -4657,6 +6138,8 @@ async function callCodexFinancialAnalysis(context) {
     "你是严谨的财务报表分析助手。",
     "这是只读分析任务：不要修改文件，不要运行命令，不要联网检索，不要给买卖建议或目标价。",
     "只能基于下面 JSON 中的结构化财务数据、evidencePackage、period、raw/display 数值和 accuracyNotes 做分析。",
+    "必须结合 evidencePackage.documents 的财报/公告正文摘录，包括 textSample、excerpts、riskExcerpts；不要只看结构化财务表。",
+    "必须主动挖掘隐藏风险：利润和经营现金流背离、应收账款/存货异常增长、合同负债不足、毛利率或价格压力、客户集中、关联交易、诉讼担保、减值、流动性和收入确认风险。",
     "必须额外分析：产品或服务是否有垄断性/寡头格局/替代风险，是否有定价权，业绩持续性，当前经济与货币政策约束，行业景气天花板，以及业绩增速确定性。",
     "产品壁垒和定价权需要结合 company.profile、evidencePackage.documents/excerpts、毛利/经营利润/现金流、应收/存货/合同负债等证据；证据不足必须写无法判断。",
     "当前经济、货币政策、行业天花板只允许引用 externalContext 中提供的信息；没有提供就写缺少实时外部上下文，不能凭空判断。",
@@ -4704,12 +6187,12 @@ async function callFinancialAnalysisModel(context) {
       {
         role: "system",
         content:
-          "你是严谨的财务报表分析助手。必须用中文输出，只能分析用户提供的结构化财务数据和外部上下文。不得给出买入、卖出、目标价或保证性结论。"
+          "你是严谨的财务报表分析助手。必须用中文输出，只能分析用户提供的结构化财务数据、财报/公告正文摘录和外部上下文。不得给出买入、卖出、目标价或保证性结论。"
       },
       {
         role: "user",
         content:
-          "请基于下面 JSON 分析公司的季度财务表现、产品壁垒、定价权、持续性、宏观货币政策影响、行业景气天花板和业绩增速确定性。所有财务结论都必须引用具体报告期和具体数值；商业质量和宏观行业结论必须引用 company.profile、evidencePackage 或 externalContext。externalContext 可能包含服务端预先联网抓取的 FRED 指标和 DuckDuckGo Lite 搜索摘要；引用时必须说明来源和日期，搜索摘要只能作为线索，不能当作已验证事实。缺失值、资料缺失或缺少上下文必须说明无法判断，并指出还需要哪类资料。请返回符合 schema 的 JSON。\n\n" +
+          "请基于下面 JSON 分析公司的季度财务表现、产品壁垒、定价权、持续性、宏观货币政策影响、行业景气天花板和业绩增速确定性。必须结合 evidencePackage.documents 中的财报/公告正文摘录，特别是 riskExcerpts，主动寻找隐藏风险：利润和经营现金流背离、应收账款/存货异常增长、合同负债不足、毛利率或价格压力、客户集中、关联交易、诉讼担保、减值、流动性和收入确认风险。所有财务结论都必须引用具体报告期和具体数值；商业质量和宏观行业结论必须引用 company.profile、evidencePackage 或 externalContext。externalContext 可能包含服务端预先联网抓取的 FRED 指标和 DuckDuckGo Lite 搜索摘要；引用时必须说明来源和日期，搜索摘要只能作为线索，不能当作已验证事实。缺失值、资料缺失或缺少上下文必须说明无法判断，并指出还需要哪类资料。请返回符合 schema 的 JSON。\n\n" +
           JSON.stringify(context)
       }
     ],
@@ -5645,7 +7128,7 @@ function resolveAshareRowQueries(rows, queries = []) {
   return { matches, missing };
 }
 
-async function getAshareRankings(force = false, options = parseRankingOptions()) {
+async function getAshareRankings(force = false, options = parseRankingOptions(), progress = null) {
   const startedAt = Date.now();
   const reportInfo = ashareReportInfo();
   const cacheName = `ashare-rankings-v${ASHARE_DATA_FILTER_VERSION}-${reportInfo.date}-${rankingOptionsFingerprint(options)}.json`;
@@ -5746,6 +7229,7 @@ async function getAshareRankings(force = false, options = parseRankingOptions())
     if (b.score !== a.score) return b.score - a.score;
     return String(b.filing.filingDate).localeCompare(String(a.filing.filingDate));
   });
+  await attachAnnouncementReactions(ranked, "cn", force, progress);
   const diagnostics = {
     version: 1,
     counts: {
@@ -5815,7 +7299,8 @@ async function getAshareRankings(force = false, options = parseRankingOptions())
       filings: "东方财富数据中心 RPT_LICO_FN_CPD",
       text: "东方财富财报 PDF 正文；regex/string keyword matching，不调用大模型",
       universe: "东方财富 A股财报数据",
-      nextEarnings: "东方财富 RPT_PUBLIC_BS_APPOIN 预约披露时间"
+      nextEarnings: "东方财富 RPT_PUBLIC_BS_APPOIN 预约披露时间",
+      priceReaction: "东方财富日 K 收盘价"
     },
     nextEarningsStats: nextAppointments.stats,
     totals: {
